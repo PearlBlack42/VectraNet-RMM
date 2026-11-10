@@ -1,0 +1,6 @@
+{
+  "name": "VectraNet RMM & Asset Discovery",
+  "description": "Ultra-lightweight IT Asset Discovery, Interactive Network Topology, Encrypted Credential Vault, and Remote Agent Push Deployment Platform.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
