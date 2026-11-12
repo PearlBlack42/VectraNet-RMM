@@ -2916,6 +2916,24 @@ func buildManualPowerShellAgentOneLiner(serverOrigin, targetIP string) string {
 	)
 }
 
+// querySMB2NTLMTargetName queries TCP port 445 via SMB2 Negotiate + NTLMSSP Challenge
+// to extract the authentic NetBIOS/DNS computer name of the target host.
+// Supports both querySMB2NTLMTargetName(ip) and querySMB2NTLMTargetName(ip, timeout).
+func querySMB2NTLMTargetName(ip string, timeout ...time.Duration) string {
+	dur := 1200 * time.Millisecond
+	if len(timeout) > 0 && timeout[0] > 0 {
+		dur = timeout[0]
+	}
+	raw := querySMBNTLMSSPHostname(ip, dur)
+	if raw == "" {
+		return ""
+	}
+	if clean := sanitizeResolvedHostname(raw, ip); clean != "" {
+		return clean
+	}
+	return strings.TrimSpace(raw)
+}
+
 // executeNativeGoSMBRPCServiceDeploy executes a Native Go SMB2 (Port 445) + DCE/RPC Endpoint Mapper (Port 135)
 // handshake and Windows IPC$/SCM Service & WMI probe. It strictly uses Port 445 for SMB2/IPC$ and Port 135 for RPC,
 // never mixing HTTP/HTTPS WinRM onto Port 445.
