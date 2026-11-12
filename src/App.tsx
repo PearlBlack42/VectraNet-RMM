@@ -26,6 +26,7 @@ import {
   DeviceStatus,
   EngineConfigState,
   NotificationItem,
+  ScanProgressState,
   SystemLogEntry,
   SystemMetricsSummary,
 } from './types/network';
@@ -81,8 +82,9 @@ export default function App() {
   const [agentFilter, setAgentFilter] = useState<'all' | AgentState>('all');
   const [selectedDeviceIds, setSelectedDeviceIds] = useState<string[]>([]);
 
-  // Subnet CIDR Scanner state
-  const [scanCidrInput, setScanCidrInput] = useState('10.24.10.0/24');
+  // Subnet CIDR Scanner & Real-Time Progress state
+  const [scanCidrInput, setScanCidrInput] = useState('127.0.0.1/32');
+  const [scanProgress, setScanProgress] = useState<ScanProgressState | null>(null);
   const [scanMessage, setScanMessage] = useState<string | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
 
@@ -134,6 +136,20 @@ export default function App() {
     }
   }, []);
 
+  // Auto-detect local OS interface CIDR on initial mount
+  useEffect(() => {
+    fetch(`${API_BASE}/api/v1/network/local-cidr`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: { cidr?: string } | null) => {
+        if (data?.cidr) {
+          setScanCidrInput(data.cidr);
+        }
+      })
+      .catch(() => {
+        // Keep default if endpoint unavailable
+      });
+  }, []);
+
   useEffect(() => {
     void fetchLiveTelemetry();
     const pollTimer = window.setInterval(() => {
@@ -141,6 +157,42 @@ export default function App() {
     }, 5000);
     return () => window.clearInterval(pollTimer);
   }, [fetchLiveTelemetry]);
+
+  // Poll /api/v1/scan/status every 300ms while a subnet scan is actively running
+  useEffect(() => {
+    if (!scanProgress || scanProgress.status !== 'running') {
+      return;
+    }
+
+    let lastDiscoveredCount = scanProgress.discoveredCount;
+    const statusTimer = window.setInterval(async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/v1/scan/status`);
+        if (!res.ok) return;
+        const statusData = (await res.json()) as ScanProgressState;
+        setScanProgress(statusData);
+
+        if (statusData.discoveredCount > lastDiscoveredCount) {
+          lastDiscoveredCount = statusData.discoveredCount;
+          void fetchLiveTelemetry();
+        }
+
+        if (statusData.status === 'completed' || statusData.status === 'failed') {
+          window.clearInterval(statusTimer);
+          void fetchLiveTelemetry();
+          if (statusData.status === 'completed') {
+            setScanMessage(statusData.message);
+          } else if (statusData.error) {
+            setScanError(statusData.error);
+          }
+        }
+      } catch {
+        // Ignore transient status poll error
+      }
+    }, 300);
+
+    return () => window.clearInterval(statusTimer);
+  }, [scanProgress, fetchLiveTelemetry]);
 
   const fleetSummary = useMemo(() => computeFleetSummary(devices), [devices]);
 
@@ -224,19 +276,17 @@ export default function App() {
         body: JSON.stringify({ cidr: scanCidrInput.trim() }),
       });
 
-      if (res.ok) {
-        const discovered = (await res.json()) as { id?: string; hostname?: string; ip?: string; ipAddress?: string };
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        setScanError(errBody.error || 'Gagal memulai pemindaian subnet');
+        return;
+      }
+
+      const initialProgress = (await res.json()) as ScanProgressState;
+      setScanProgress(initialProgress);
+      if (initialProgress.status === 'completed') {
+        setScanMessage(initialProgress.message);
         await fetchLiveTelemetry();
-        const hostLabel = discovered.hostname || 'NEW-ENDPOINT';
-        const ipLabel = discovered.ipAddress || discovered.ip || scanCidrInput;
-        if (discovered.id) {
-          setSelectedDeviceIds((prev) => [discovered.id as string, ...prev]);
-        }
-        setScanMessage(
-          lang === 'id'
-            ? `Sweep CIDR ${scanCidrInput} selesai (${parsed.estimatedHosts} IP dipindai): host agentless baru ${hostLabel} (${ipLabel}) disimpan ke database.`
-            : `CIDR Sweep ${scanCidrInput} completed (${parsed.estimatedHosts} IPs scanned): new agentless host ${hostLabel} (${ipLabel}) stored in database.`
-        );
       }
     } catch (err) {
       setScanError(`Gagal menghubungi endpoint /api/v1/scan: ${(err as Error).message}`);
@@ -346,6 +396,8 @@ export default function App() {
     () => devices.filter((d) => deployTargetIds.includes(d.id)),
     [devices, deployTargetIds]
   );
+
+  const isScanning = scanProgress?.status === 'running';
 
   return (
     <div className="min-h-screen bg-[#0B0F17] text-slate-100 flex flex-col">
@@ -707,7 +759,7 @@ export default function App() {
           {/* Active View Router */}
           {activeTab === 'inventory' && (
             <div className="space-y-6">
-              {/* Concurrent IP Subnet Sweeper Bar */}
+              {/* Real Concurrent IP Subnet Sweeper Bar */}
               <section className="bg-[#161F30] border border-[#1E293B] rounded-xl p-5">
                 <form
                   onSubmit={handleRunSubnetScan}
@@ -719,15 +771,15 @@ export default function App() {
                       htmlFor="cidr-scan-input"
                       className="block text-xs font-semibold text-slate-200 mb-1 flex items-center gap-1.5"
                     >
-                      <Radar className="w-4 h-4 text-emerald-400" />
+                      <Radar className={`w-4 h-4 text-emerald-400 ${isScanning ? 'animate-spin' : ''}`} />
                       {lang === 'id'
-                        ? 'Pemindai Subnet IP Konkuren & Sinkronisasi PostgreSQL (/api/v1/scan)'
-                        : 'Concurrent CIDR IP Sweeper & PostgreSQL Sync (/api/v1/scan)'}
+                        ? 'Pemindai Subnet Jaringan Nyata (TCP Dial + ICMP Ping + OS ARP Cache -> PostgreSQL)'
+                        : 'Real Network Subnet Scanner (TCP Dial + ICMP Ping + OS ARP Cache -> PostgreSQL)'}
                     </label>
                     <p className="text-xs text-slate-400 mb-2">
                       {lang === 'id'
-                        ? 'Memindai rentang CIDR secara paralel (ICMP + ARP + TCP Port 22/161/445/5986) atau menerima telemetri agen via /api/v1/agent/ingest.'
-                        : 'Concurrently sweeps CIDR subnets (ICMP + ARP + TCP 22/161/445/5986) or ingests live agent payloads via /api/v1/agent/ingest.'}
+                        ? 'Memindai host aktif nyata di jaringan lokal secara paralel (Port 22, 80, 135, 443, 445, 3389, 5985 + Ping + ARP Table) dan menyimpannya ke database.'
+                        : 'Concurrently probes real active hosts on the local network (TCP 22, 80, 135, 443, 445, 3389, 5985 + Ping + ARP Table) and persists them to PostgreSQL.'}
                     </p>
                     <div className="flex flex-col sm:flex-row gap-2.5">
                       <input
@@ -735,15 +787,23 @@ export default function App() {
                         type="text"
                         value={scanCidrInput}
                         onChange={(e) => setScanCidrInput(e.target.value)}
-                        placeholder="10.24.10.0/24"
-                        className="flex-1 px-3.5 py-2 text-sm font-mono bg-[#0B0F17] border border-[#1E293B] rounded-lg text-slate-100 focus:outline-none focus:border-emerald-500"
+                        placeholder="192.168.1.0/24"
+                        disabled={isScanning}
+                        className="flex-1 px-3.5 py-2 text-sm font-mono bg-[#0B0F17] border border-[#1E293B] rounded-lg text-slate-100 focus:outline-none focus:border-emerald-500 disabled:opacity-60"
                       />
                       <button
                         type="submit"
-                        className="px-4 py-2 text-xs font-semibold bg-emerald-500 hover:bg-emerald-400 text-slate-950 rounded-lg transition-colors flex items-center justify-center gap-2 whitespace-nowrap cursor-pointer"
+                        disabled={isScanning}
+                        className="px-4 py-2 text-xs font-semibold bg-emerald-500 hover:bg-emerald-400 disabled:opacity-60 text-slate-950 rounded-lg transition-colors flex items-center justify-center gap-2 whitespace-nowrap cursor-pointer"
                       >
-                        <Radar className="w-4 h-4" />
-                        {lang === 'id' ? 'Pindai Subnet Sekarang' : 'Scan Subnet Now'}
+                        <Radar className={`w-4 h-4 ${isScanning ? 'animate-spin' : ''}`} />
+                        {isScanning
+                          ? lang === 'id'
+                            ? `Memindai... (${scanProgress?.progressPct ?? 0}%)`
+                            : `Scanning... (${scanProgress?.progressPct ?? 0}%)`
+                          : lang === 'id'
+                          ? 'Pindai Subnet Sekarang'
+                          : 'Scan Subnet Now'}
                       </button>
                       <button
                         type="button"
@@ -757,12 +817,47 @@ export default function App() {
                   </div>
                 </form>
 
+                {/* Animated Real-Time Scan Progress Bar */}
+                {scanProgress && scanProgress.status !== 'idle' && (
+                  <div
+                    role="region"
+                    aria-label="Subnet Scan Progress"
+                    className="mt-4 p-3.5 rounded-lg bg-[#0B0F17] border border-[#1E293B] space-y-2"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                      <span className="font-mono text-slate-200">
+                        {scanProgress.status === 'running'
+                          ? scanProgress.currentPhase
+                          : scanProgress.message}
+                      </span>
+                      <span className="font-mono tabular-nums text-emerald-400 font-semibold">
+                        {scanProgress.scannedHosts} / {scanProgress.totalHosts} IP ({scanProgress.progressPct}%) ·{' '}
+                        {lang === 'id' ? 'Host Aktif:' : 'Live Hosts:'} {scanProgress.discoveredCount}
+                      </span>
+                    </div>
+
+                    <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-emerald-500 transition-all duration-300 ease-out"
+                        style={{ width: `${Math.min(100, Math.max(2, scanProgress.progressPct))}%` }}
+                      />
+                    </div>
+
+                    {scanProgress.discoveredHosts.length > 0 && (
+                      <div className="text-[11px] font-mono text-cyan-400 truncate">
+                        {lang === 'id' ? 'Terdeteksi:' : 'Discovered:'}{' '}
+                        {scanProgress.discoveredHosts.join(' · ')}
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 {scanError && (
                   <p role="alert" className="text-xs text-rose-400 mt-2.5">
                     {scanError}
                   </p>
                 )}
-                {scanMessage && (
+                {scanMessage && !isScanning && (
                   <p role="status" className="text-xs text-emerald-400 mt-2.5">
                     {scanMessage}
                   </p>
@@ -780,8 +875,8 @@ export default function App() {
                     </h2>
                     <p className="text-xs text-slate-400 mt-0.5">
                       {lang === 'id'
-                        ? 'Terhubung ke database PostgreSQL (vectranet_rmm). Pilih host Agentless untuk menginstal agen native via WinRM atau SSH.'
-                        : 'Connected to PostgreSQL (vectranet_rmm). Select agentless endpoints to silently push the native Go agent.'}
+                        ? 'Menampilkan perangkat nyata yang merespons di jaringan lokal atau mengirim telemetri agen ke PostgreSQL (vectranet_rmm).'
+                        : 'Displays real devices responding on the local network or sending agent telemetry to PostgreSQL (vectranet_rmm).'}
                     </p>
                   </div>
 
@@ -873,8 +968,8 @@ export default function App() {
                               </div>
                               <p className="text-xs text-slate-400 leading-relaxed">
                                 {lang === 'id'
-                                  ? 'Tabel inventaris saat ini kosong ([]). Jalankan agen Go lokal (agents/windows, agents/linux, atau agents/macos) yang mengarah ke /api/v1/agent/ingest, atau klik tombol "Pindai Subnet Sekarang" / "Uji Ingest Agen Lokal" di atas.'
-                                  : 'The inventory table is currently empty ([]). Start a local Go agent pointing to /api/v1/agent/ingest, or click "Scan Subnet Now" / "Test Local Agent Ingest" above.'}
+                                  ? 'Tabel inventaris saat ini kosong ([]). Klik "Pindai Subnet Sekarang" untuk memindai jaringan lokal Anda secara nyata, atau jalankan agen Go lokal yang mengarah ke /api/v1/agent/ingest.'
+                                  : 'The inventory table is currently empty ([]). Click "Scan Subnet Now" to probe your real local network, or start a local Go agent pointing to /api/v1/agent/ingest.'}
                               </p>
                             </div>
                           </td>

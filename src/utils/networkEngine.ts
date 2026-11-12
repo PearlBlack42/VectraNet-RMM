@@ -41,11 +41,12 @@ export function parseCidrRange(cidr: string): CidrParseResult {
     return { valid: false, networkAddress: '', prefixLength: 0, estimatedHosts: 0, error: 'Invalid CIDR prefix' };
   }
   const prefix = Number(prefixStr);
-  if (prefix < 16 || prefix > 30) {
-    return { valid: false, networkAddress: '', prefixLength: prefix, estimatedHosts: 0, error: 'Prefix must be between /16 and /30' };
+  if (prefix < 16 || prefix > 32) {
+    return { valid: false, networkAddress: '', prefixLength: prefix, estimatedHosts: 0, error: 'Prefix must be between /16 and /32' };
   }
   const hostBits = 32 - prefix;
-  const estimatedHosts = Math.max(0, Math.pow(2, hostBits) - 2);
+  const estimatedHosts =
+    prefix === 32 ? 1 : prefix === 31 ? 2 : Math.max(0, Math.pow(2, hostBits) - 2);
   return {
     valid: true,
     networkAddress: ip,

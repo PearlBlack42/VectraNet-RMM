@@ -107,6 +107,21 @@ export interface DeploymentJob {
   logs: string[];
 }
 
+export interface ScanProgressState {
+  jobId: string;
+  status: 'idle' | 'running' | 'completed' | 'failed';
+  cidr: string;
+  totalHosts: number;
+  scannedHosts: number;
+  progressPct: number;
+  discoveredCount: number;
+  discoveredHosts: string[];
+  currentPhase: string;
+  message: string;
+  elapsedMs: number;
+  error?: string;
+}
+
 export interface SystemLogEntry {
   id: string;
   timestamp: string;

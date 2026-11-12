@@ -1,5 +1,5 @@
 // ============================================================================
-// VECTRANET RMM — PRODUCTION BACKEND API & TELEMETRY INGESTION SERVER (Go)
+// VECTRANET RMM — PRODUCTION BACKEND API & REAL NETWORK DISCOVERY SERVER (Go)
 // File: backend/ingest_handler.go
 // Database: postgres://postgres:postgres@localhost:5432/vectranet_rmm
 //
@@ -7,7 +7,8 @@
 //   - GET    /api/v1/devices       -> Fetch all discovered/monitored devices + interfaces + software
 //   - GET    /api/v1/metrics       -> Fetch real-time engine metrics, DB status & centralized logs
 //   - POST   /api/v1/agent/ingest  -> Receive Gzip/JSON telemetry from Windows/Linux/macOS agents
-//   - POST   /api/v1/scan          -> Concurrent CIDR subnet sweep & persist discovered endpoints
+//   - POST   /api/v1/scan          -> Start real concurrent CIDR subnet scan (TCP Dial + ICMP Ping + ARP)
+//   - GET    /api/v1/scan/status   -> Real-time scan progress (progressPct, scannedHosts, discoveredCount)
 //   - GET    /api/v1/credentials   -> List encrypted AES-256-GCM credentials from credential_vault
 //   - POST   /api/v1/credentials   -> Store new encrypted credential in credential_vault
 //   - DELETE /api/v1/credentials   -> Delete credential by ?id=<uuid>
@@ -25,6 +26,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/subtle"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,9 +36,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"regexp"
 	"runtime"
+	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -171,18 +178,55 @@ type AgentIngestRequest struct {
 }
 
 // ============================================================================
-// 2. SERVER STRUCT & SCHEMA AUTO-MIGRATION
+// 2. REAL-TIME SUBNET SCAN PROGRESS STATE
+// ============================================================================
+
+type ScanProgressDTO struct {
+	JobID           string   `json:"jobId"`
+	Status          string   `json:"status"` // "idle" | "running" | "completed" | "failed"
+	CIDR            string   `json:"cidr"`
+	TotalHosts      int      `json:"totalHosts"`
+	ScannedHosts    int      `json:"scannedHosts"`
+	ProgressPct     int      `json:"progressPct"`
+	DiscoveredCount int      `json:"discoveredCount"`
+	DiscoveredHosts []string `json:"discoveredHosts"`
+	CurrentPhase    string   `json:"currentPhase"`
+	Message         string   `json:"message"`
+	ElapsedMs       int64    `json:"elapsedMs"`
+	Error           string   `json:"error,omitempty"`
+}
+
+type DiscoveredHostResult struct {
+	IPAddress  string
+	MACAddress string
+	Hostname   string
+	OSFamily   string
+	OSVersion  string
+	Role       string
+	OpenPorts  []int
+	LatencyMs  float64
+}
+
+// ============================================================================
+// 3. SERVER STRUCT & SCHEMA AUTO-MIGRATION
 // ============================================================================
 
 type VectraNetServer struct {
 	dbPool        *pgxpool.Pool
 	expectedToken string
+
+	scanMu       sync.RWMutex
+	scanProgress ScanProgressDTO
 }
 
 func NewVectraNetServer(dbPool *pgxpool.Pool, expectedToken string) *VectraNetServer {
 	return &VectraNetServer{
 		dbPool:        dbPool,
 		expectedToken: expectedToken,
+		scanProgress: ScanProgressDTO{
+			Status:          "idle",
+			DiscoveredHosts: make([]string, 0),
+		},
 	}
 }
 
@@ -287,7 +331,7 @@ func ensureSchema(ctx context.Context, db *pgxpool.Pool) error {
 }
 
 // ============================================================================
-// 3. CORS MIDDLEWARE
+// 4. CORS MIDDLEWARE
 // ============================================================================
 
 func withCORS(next http.Handler) http.Handler {
@@ -304,7 +348,7 @@ func withCORS(next http.Handler) http.Handler {
 }
 
 // ============================================================================
-// 4. GET /api/v1/devices — FETCH REAL-TIME FLEET ASSETS FROM POSTGRESQL
+// 5. GET /api/v1/devices — FETCH REAL-TIME FLEET ASSETS FROM POSTGRESQL
 // ============================================================================
 
 func (s *VectraNetServer) handleGetDevices(w http.ResponseWriter, r *http.Request) {
@@ -462,7 +506,7 @@ func (s *VectraNetServer) fetchDeviceSoftware(ctx context.Context, deviceID stri
 }
 
 // ============================================================================
-// 5. GET /api/v1/metrics — ENGINE HEALTH, TIMESCALEDB STATS & LOG STREAM
+// 6. GET /api/v1/metrics — ENGINE HEALTH, TIMESCALEDB STATS & LOG STREAM
 // ============================================================================
 
 func (s *VectraNetServer) handleGetMetrics(w http.ResponseWriter, r *http.Request) {
@@ -534,7 +578,7 @@ func (s *VectraNetServer) handleGetMetrics(w http.ResponseWriter, r *http.Reques
 }
 
 // ============================================================================
-// 6. POST /api/v1/agent/ingest — GZIP PAYLOAD INGESTION FROM NATIVE AGENTS
+// 7. POST /api/v1/agent/ingest — GZIP PAYLOAD INGESTION FROM NATIVE AGENTS
 // ============================================================================
 
 func (s *VectraNetServer) handleAgentIngest(w http.ResponseWriter, r *http.Request) {
@@ -802,9 +846,24 @@ func (s *VectraNetServer) persistTelemetryTransaction(ctx context.Context, p Age
 }
 
 // ============================================================================
-// 7. POST /api/v1/scan, /api/v1/credentials, /api/v1/deploy
+// 8. REAL CONCURRENT SUBNET SCANNER (ARP + ICMP PING + MULTI-PORT TCP DIAL)
 // ============================================================================
 
+// handleGetScanStatus returns live scan progress for the animated UI progress bar
+func (s *VectraNetServer) handleGetScanStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	s.scanMu.RLock()
+	snapshot := s.scanProgress
+	s.scanMu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(snapshot)
+}
+
+// handleSubnetScan launches a real concurrent CIDR sweep across the target network
 func (s *VectraNetServer) handleSubnetScan(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
@@ -814,71 +873,569 @@ func (s *VectraNetServer) handleSubnetScan(w http.ResponseWriter, r *http.Reques
 	var req struct {
 		CIDR string `json:"cidr"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.CIDR) == "" {
-		http.Error(w, `{"error":"cidr is required"}`, http.StatusBadRequest)
-		return
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	targetCIDR := strings.TrimSpace(req.CIDR)
+	if targetCIDR == "" || strings.EqualFold(targetCIDR, "auto") {
+		targetCIDR = detectLocalSubnetCIDR()
 	}
 
-	ip, ipNet, err := net.ParseCIDR(strings.TrimSpace(req.CIDR))
+	ips, normalizedCIDR, err := enumerateCIDRHosts(targetCIDR, 1024)
 	if err != nil {
-		http.Error(w, `{"error":"invalid CIDR notation"}`, http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf(`{"error":"invalid CIDR notation: %v"}`, err), http.StatusBadRequest)
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	s.scanMu.Lock()
+	if s.scanProgress.Status == "running" {
+		current := s.scanProgress
+		s.scanMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(current)
+		return
+	}
+
+	jobID := fmt.Sprintf("scan-%d", time.Now().UnixMilli())
+	s.scanProgress = ScanProgressDTO{
+		JobID:           jobID,
+		Status:          "running",
+		CIDR:            normalizedCIDR,
+		TotalHosts:      len(ips),
+		ScannedHosts:    0,
+		ProgressPct:     2,
+		DiscoveredCount: 0,
+		DiscoveredHosts: make([]string, 0),
+		CurrentPhase:    "Probing ARP Cache, ICMP Echo & Parallel TCP Ports (22, 80, 135, 443, 445, 3389, 5985)...",
+		Message:         fmt.Sprintf("Memindai %d alamat IP pada subnet %s...", len(ips), normalizedCIDR),
+		ElapsedMs:       0,
+	}
+	initialSnapshot := s.scanProgress
+	s.scanMu.Unlock()
+
+	// Run the real network sweep asynchronously so the frontend can poll /api/v1/scan/status
+	go s.runConcurrentSubnetSweep(jobID, normalizedCIDR, ips)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(initialSnapshot)
+}
+
+func (s *VectraNetServer) runConcurrentSubnetSweep(jobID, cidr string, ips []string) {
+	startTime := time.Now()
+	total := len(ips)
+
+	// 1. Pre-read local interface IPs/MACs and OS ARP table
+	localIfaces := readLocalInterfaceMap()
+	arpTable := readOSArpTable()
+
+	var scannedCount int64
+	var discoveredCount int64
+
+	// Worker pool: 64 concurrent goroutines for fast parallel scanning without exhausting file descriptors
+	const maxWorkers = 64
+	sem := make(chan struct{}, maxWorkers)
+	var wg sync.WaitGroup
+
+	for _, targetIP := range ips {
+		wg.Add(1)
+		sem <- struct{}{}
+
+		go func(ipAddr string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			probeRes, alive := probeRealHost(ipAddr, localIfaces)
+			done := atomic.AddInt64(&scannedCount, 1)
+
+			if alive {
+				// Refresh ARP table lookup if MAC wasn't already known
+				mac := probeRes.MACAddress
+				if mac == "" {
+					if m, ok := arpTable[ipAddr]; ok {
+						mac = m
+					}
+				}
+				if mac == "" {
+					// Re-check OS ARP table after ping/TCP handshake populated kernel neighbor cache
+					freshArp := readOSArpTable()
+					if m, ok := freshArp[ipAddr]; ok {
+						mac = m
+					}
+				}
+				if mac == "" {
+					// Fallback deterministic IEEE locally-administered MAC derived from real IPv4 octets
+					mac = deriveDeterministicMACFromIP(ipAddr)
+				}
+				probeRes.MACAddress = mac
+
+				// Immediately persist the real discovered host to PostgreSQL
+				if err := s.persistDiscoveredHost(cidr, probeRes); err == nil {
+					atomic.AddInt64(&discoveredCount, 1)
+					s.scanMu.Lock()
+					s.scanProgress.DiscoveredCount = int(atomic.LoadInt64(&discoveredCount))
+					s.scanProgress.DiscoveredHosts = append(s.scanProgress.DiscoveredHosts, fmt.Sprintf("%s (%s)", probeRes.Hostname, probeRes.IPAddress))
+					s.scanMu.Unlock()
+				}
+			}
+
+			pct := int(math.Round((float64(done) / float64(maxInt(1, total))) * 100.0))
+			if pct > 99 && int(done) < total {
+				pct = 99
+			}
+
+			s.scanMu.Lock()
+			if s.scanProgress.JobID == jobID {
+				s.scanProgress.ScannedHosts = int(done)
+				s.scanProgress.ProgressPct = maxInt(2, pct)
+				s.scanProgress.ElapsedMs = time.Since(startTime).Milliseconds()
+				s.scanProgress.CurrentPhase = fmt.Sprintf("Probing %s (%d/%d IP)...", ipAddr, done, total)
+			}
+			s.scanMu.Unlock()
+		}(targetIP)
+	}
+
+	wg.Wait()
+
+	elapsed := time.Since(startTime)
+	finalDiscovered := int(atomic.LoadInt64(&discoveredCount))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _ = s.dbPool.Exec(ctx, `
+		INSERT INTO system_logs (level, module, message, latency_ms)
+		VALUES ('INFO', 'SWEEPER-ICMP', $1, $2)
+	`, fmt.Sprintf("CIDR Sweep %s completed (%d IPs probed, %d live host(s) discovered in %dms)", cidr, total, finalDiscovered, elapsed.Milliseconds()), float64(elapsed.Milliseconds()))
+
+	s.scanMu.Lock()
+	if s.scanProgress.JobID == jobID {
+		s.scanProgress.Status = "completed"
+		s.scanProgress.ScannedHosts = total
+		s.scanProgress.ProgressPct = 100
+		s.scanProgress.DiscoveredCount = finalDiscovered
+		s.scanProgress.ElapsedMs = elapsed.Milliseconds()
+		s.scanProgress.CurrentPhase = "Completed"
+		s.scanProgress.Message = fmt.Sprintf(
+			"Pemindaian %s selesai dalam %.2f detik (%d IP dipindai): ditemukan %d perangkat aktif nyata.",
+			cidr,
+			elapsed.Seconds(),
+			total,
+			finalDiscovered,
+		)
+	}
+	s.scanMu.Unlock()
+}
+
+// probeRealHost checks if an IP is alive using parallel TCP dials to common ports + native OS ping
+func probeRealHost(ip string, localIfaces map[string]localIfaceInfo) (DiscoveredHostResult, bool) {
+	start := time.Now()
+
+	// 1. Check if this IP belongs to the local machine's own network interface
+	if localInfo, isSelf := localIfaces[ip]; isSelf {
+		host, _ := os.Hostname()
+		if host == "" {
+			host = ip
+		}
+		osFam, osVer := detectLocalOSStrings()
+		return DiscoveredHostResult{
+			IPAddress:  ip,
+			MACAddress: localInfo.MAC,
+			Hostname:   host,
+			OSFamily:   osFam,
+			OSVersion:  osVer,
+			Role:       "server",
+			OpenPorts:  []int{},
+			LatencyMs:  0.2,
+		}, true
+	}
+
+	// 2. Parallel TCP Dial Probe across common service ports
+	probePorts := []int{22, 80, 135, 139, 443, 445, 3000, 3389, 5432, 5985, 5986, 8080, 8291}
+	var openPorts []int
+	var portMu sync.Mutex
+	var portWg sync.WaitGroup
+	var minLatency float64 = 9999
+
+	for _, port := range probePorts {
+		portWg.Add(1)
+		go func(p int) {
+			defer portWg.Done()
+			t0 := time.Now()
+			conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, p), 280*time.Millisecond)
+			if err == nil {
+				_ = conn.Close()
+				rtt := math.Max(0.3, math.Round(float64(time.Since(t0).Microseconds())/100.0)/10.0)
+				portMu.Lock()
+				openPorts = append(openPorts, p)
+				if rtt < minLatency {
+					minLatency = rtt
+				}
+				portMu.Unlock()
+			}
+		}(port)
+	}
+	portWg.Wait()
+
+	alive := len(openPorts) > 0
+
+	// 3. Fallback to OS ICMP Ping if no TCP ports accepted connection
+	if !alive {
+		pingStart := time.Now()
+		if runSystemPing(ip, 380*time.Millisecond) {
+			alive = true
+			minLatency = math.Max(0.5, math.Round(float64(time.Since(pingStart).Microseconds())/100.0)/10.0)
+		}
+	}
+
+	if !alive {
+		return DiscoveredHostResult{}, false
+	}
+
+	sort.Ints(openPorts)
+	if minLatency >= 9999 {
+		minLatency = math.Max(0.5, math.Round(float64(time.Since(start).Microseconds())/100.0)/10.0)
+	}
+
+	// 4. Reverse DNS lookup (bounded timeout) for real hostname
+	hostname := resolveReverseDNS(ip, 350*time.Millisecond)
+	if hostname == "" {
+		hostname = fmt.Sprintf("HOST-%s", strings.ReplaceAll(ip, ".", "-"))
+	}
+
+	osFamily, osVersion, role := fingerprintOSAndRole(openPorts)
+
+	return DiscoveredHostResult{
+		IPAddress: ip,
+		Hostname:  hostname,
+		OSFamily:  osFamily,
+		OSVersion: osVersion,
+		Role:      role,
+		OpenPorts: openPorts,
+		LatencyMs: minLatency,
+	}, true
+}
+
+func (s *VectraNetServer) persistDiscoveredHost(cidr string, h DiscoveredHostResult) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	var count int
-	_ = s.dbPool.QueryRow(ctx, `SELECT COUNT(*) FROM devices`).Scan(&count)
-
-	baseOctets := strings.Split(ip.Mask(ipNet.Mask).String(), ".")
-	prefix3 := "10.24.10"
-	if len(baseOctets) == 4 {
-		prefix3 = strings.Join(baseOctets[:3], ".")
+	portsStr := "ICMP Echo"
+	if len(h.OpenPorts) > 0 {
+		parts := make([]string, 0, len(h.OpenPorts))
+		for _, p := range h.OpenPorts {
+			parts = append(parts, fmt.Sprintf("%d", p))
+		}
+		portsStr = "TCP " + strings.Join(parts, ",")
 	}
-	hostNum := 101 + (count % 140)
-	discoveredIP := fmt.Sprintf("%s.%d", prefix3, hostNum)
-	discoveredMAC := fmt.Sprintf("00:15:5D:8A:%02X:%02X", hostNum, (count+17)%255)
-	discoveredHost := fmt.Sprintf("NODE-SWEEP-%02d", count+1)
 
 	var deviceID string
-	err = s.dbPool.QueryRow(ctx, `
+	err := s.dbPool.QueryRow(ctx, `
 		INSERT INTO devices (
 			hostname, ip_address, mac_address, os_family, os_version, kernel_arch,
 			device_role, status, agent_state, agent_version, agent_memory_mb,
-			cpu_model, cpu_cores, ram_total_gb, disk_total_gb, subnet_cidr, location, latency_ms
+			cpu_model, cpu_cores, ram_total_gb, disk_total_gb, subnet_cidr, location, latency_ms, last_seen, updated_at
 		) VALUES (
-			$1, $2::inet, $3::macaddr, 'Ubuntu Linux', '24.04 LTS', '6.8.0-generic x86_64',
-			'server', 'online', 'agentless', '', 0,
-			'AMD EPYC 7543P', 8, 32, 512, $4, 'CIDR-AutoSweep', 1.4
+			$1, $2::inet, $3::macaddr, $4, $5, 'Detected via Network Probe',
+			$6, 'online', 'agentless', '', 0,
+			'Discovered Network Endpoint', 4, 16, 256, $7, $8, $9, NOW(), NOW()
 		)
-		ON CONFLICT (mac_address) DO UPDATE SET last_seen = NOW()
+		ON CONFLICT (mac_address) DO UPDATE SET
+			ip_address  = EXCLUDED.ip_address,
+			hostname    = CASE WHEN devices.agent_state = 'active' THEN devices.hostname ELSE EXCLUDED.hostname END,
+			subnet_cidr = EXCLUDED.subnet_cidr,
+			latency_ms  = EXCLUDED.latency_ms,
+			status      = 'online',
+			last_seen   = NOW(),
+			updated_at  = NOW()
 		RETURNING id::text;
-	`, discoveredHost, discoveredIP, discoveredMAC, req.CIDR).Scan(&deviceID)
+	`,
+		h.Hostname,
+		h.IPAddress,
+		h.MACAddress,
+		h.OSFamily,
+		h.OSVersion,
+		h.Role,
+		cidr,
+		fmt.Sprintf("LAN (%s)", portsStr),
+		h.LatencyMs,
+	).Scan(&deviceID)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"scan persist error: %v"}`, err), http.StatusInternalServerError)
-		return
+		return err
 	}
 
 	_, _ = s.dbPool.Exec(ctx, `
-		INSERT INTO network_interfaces (device_id, interface_name, ip_address, mac_address, speed_mbps, vlan_id, rx_mbps, tx_mbps, is_primary)
-		VALUES ($1, 'eth0', $2::inet, $3::macaddr, 10000, 10, 42.5, 29.1, true)
-		ON CONFLICT (device_id, interface_name) DO NOTHING;
-	`, deviceID, discoveredIP, discoveredMAC)
+		INSERT INTO network_interfaces (
+			device_id, interface_name, ip_address, mac_address,
+			speed_mbps, vlan_id, rx_mbps, tx_mbps, is_primary, updated_at
+		) VALUES (
+			$1, 'eth0', $2::inet, $3::macaddr, 1000, 1, 0, 0, true, NOW()
+		)
+		ON CONFLICT (device_id, interface_name) DO UPDATE SET
+			ip_address  = EXCLUDED.ip_address,
+			mac_address = EXCLUDED.mac_address,
+			updated_at  = NOW();
+	`, deviceID, h.IPAddress, h.MACAddress)
 
 	_, _ = s.dbPool.Exec(ctx, `
 		INSERT INTO system_logs (level, module, device_hostname, message, latency_ms)
-		VALUES ('INFO', 'SWEEPER-ICMP', $1, $2, 1.4)
-	`, discoveredHost, fmt.Sprintf("Discovered agentless endpoint %s on subnet %s (SSH 22 open)", discoveredIP, req.CIDR))
+		VALUES ('INFO', 'SWEEPER-ICMP', $1, $2, $3)
+	`, h.Hostname, fmt.Sprintf("Discovered live host %s [%s] via %s (RTT %.1f ms)", h.IPAddress, h.MACAddress, portsStr, h.LatencyMs), h.LatencyMs)
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"status":   "discovered",
-		"id":       deviceID,
-		"hostname": discoveredHost,
-		"ip":       discoveredIP,
-	})
+	return nil
 }
+
+// ============================================================================
+// 9. NETWORK DISCOVERY HELPERS (CIDR, PING, ARP TABLE, OS FINGERPRINTING)
+// ============================================================================
+
+type localIfaceInfo struct {
+	IP   string
+	MAC  string
+	CIDR string
+}
+
+func readLocalInterfaceMap() map[string]localIfaceInfo {
+	result := make(map[string]localIfaceInfo)
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return result
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		mac := strings.ToUpper(iface.HardwareAddr.String())
+		if !isValidMAC(mac) {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			if ipNet, ok := addr.(*net.IPNet); ok && ipNet.IP.To4() != nil {
+				ipStr := ipNet.IP.To4().String()
+				ones, _ := ipNet.Mask.Size()
+				netIP := ipNet.IP.Mask(ipNet.Mask)
+				result[ipStr] = localIfaceInfo{
+					IP:   ipStr,
+					MAC:  mac,
+					CIDR: fmt.Sprintf("%s/%d", netIP.String(), ones),
+				}
+			}
+		}
+	}
+	return result
+}
+
+func detectLocalSubnetCIDR() string {
+	ifaces := readLocalInterfaceMap()
+	for _, info := range ifaces {
+		if info.CIDR != "" {
+			// Cap automatic subnet to /24 so local scans complete quickly
+			ip, _, err := net.ParseCIDR(info.CIDR)
+			if err == nil && ip.To4() != nil {
+				p := strings.Split(ip.To4().String(), ".")
+				if len(p) == 4 {
+					return fmt.Sprintf("%s.%s.%s.0/24", p[0], p[1], p[2])
+				}
+			}
+		}
+	}
+	return "127.0.0.1/32"
+}
+
+func enumerateCIDRHosts(cidrStr string, maxHosts int) ([]string, string, error) {
+	ip, ipNet, err := net.ParseCIDR(strings.TrimSpace(cidrStr))
+	if err != nil {
+		// Allow single IPv4 address without /prefix
+		parsedIP := net.ParseIP(strings.TrimSpace(cidrStr))
+		if parsedIP != nil && parsedIP.To4() != nil {
+			s := parsedIP.To4().String()
+			return []string{s}, s + "/32", nil
+		}
+		return nil, "", err
+	}
+
+	ipv4 := ip.To4()
+	if ipv4 == nil {
+		return nil, "", errors.New("only IPv4 CIDR ranges are supported")
+	}
+
+	ones, bits := ipNet.Mask.Size()
+	if ones == 32 {
+		return []string{ipv4.String()}, ipv4.String() + "/32", nil
+	}
+
+	networkIP := ipv4.Mask(ipNet.Mask)
+	start := binary.BigEndian.Uint32(networkIP)
+	totalAddresses := uint32(1) << uint(bits-ones)
+
+	hosts := make([]string, 0)
+	// Skip network address (first) and broadcast address (last) for /16..30
+	firstHost := start + 1
+	lastHost := start + totalAddresses - 2
+	if ones == 31 {
+		firstHost = start
+		lastHost = start + 1
+	}
+
+	for curr := firstHost; curr <= lastHost; curr++ {
+		b := make([]byte, 4)
+		binary.BigEndian.PutUint32(b, curr)
+		hosts = append(hosts, net.IP(b).String())
+		if len(hosts) >= maxHosts {
+			break
+		}
+	}
+
+	return hosts, fmt.Sprintf("%s/%d", networkIP.String(), ones), nil
+}
+
+func runSystemPing(ip string, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout+250*time.Millisecond)
+	defer cancel()
+
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		ms := maxInt(200, int(timeout.Milliseconds()))
+		cmd = exec.CommandContext(ctx, "ping", "-n", "1", "-w", fmt.Sprintf("%d", ms), ip)
+	} else if runtime.GOOS == "darwin" {
+		cmd = exec.CommandContext(ctx, "ping", "-c", "1", "-W", "350", ip)
+	} else {
+		cmd = exec.CommandContext(ctx, "ping", "-c", "1", "-W", "1", ip)
+	}
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return false
+	}
+	lower := strings.ToLower(string(out))
+	return strings.Contains(lower, "ttl=") || strings.Contains(lower, "bytes from")
+}
+
+var macRegex = regexp.MustCompile(`(?i)([0-9a-f]{1,2}[:-]){5}([0-9a-f]{1,2})`)
+var ipv4Regex = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`)
+
+func readOSArpTable() map[string]string {
+	entries := make(map[string]string)
+
+	// 1. On Linux, read /proc/net/arp directly first (zero process overhead)
+	if data, err := os.ReadFile("/proc/net/arp"); err == nil {
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines[1:] {
+			fields := strings.Fields(line)
+			if len(fields) >= 4 {
+				ip := fields[0]
+				mac := normalizeMAC(fields[3])
+				if isValidMAC(mac) {
+					entries[ip] = mac
+				}
+			}
+		}
+	}
+
+	// 2. Cross-platform `arp -a` fallback (Windows, macOS, Linux)
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, "arp", "-a").CombinedOutput(); err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			ipMatch := ipv4Regex.FindString(line)
+			macMatch := macRegex.FindString(line)
+			if ipMatch != "" && macMatch != "" {
+				norm := normalizeMAC(macMatch)
+				if isValidMAC(norm) {
+					entries[ipMatch] = norm
+				}
+			}
+		}
+	}
+
+	return entries
+}
+
+func normalizeMAC(raw string) string {
+	clean := strings.ReplaceAll(strings.TrimSpace(raw), "-", ":")
+	parts := strings.Split(clean, ":")
+	if len(parts) != 6 {
+		return ""
+	}
+	for i, p := range parts {
+		if len(p) == 1 {
+			parts[i] = "0" + p
+		}
+	}
+	return strings.ToUpper(strings.Join(parts, ":"))
+}
+
+func isValidMAC(mac string) bool {
+	if mac == "" || mac == "00:00:00:00:00:00" || mac == "FF:FF:FF:FF:FF:FF" {
+		return false
+	}
+	hw, err := net.ParseMAC(mac)
+	return err == nil && len(hw) == 6
+}
+
+func deriveDeterministicMACFromIP(ipStr string) string {
+	parsed := net.ParseIP(ipStr)
+	if parsed != nil && parsed.To4() != nil {
+		b := parsed.To4()
+		return fmt.Sprintf("02:56:%02X:%02X:%02X:%02X", b[0], b[1], b[2], b[3])
+	}
+	return "02:56:00:00:00:01"
+}
+
+func resolveReverseDNS(ip string, timeout time.Duration) string {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	names, err := net.DefaultResolver.LookupAddr(ctx, ip)
+	if err == nil && len(names) > 0 {
+		return strings.TrimSuffix(names[0], ".")
+	}
+	return ""
+}
+
+func fingerprintOSAndRole(openPorts []int) (osFamily, osVersion, role string) {
+	hasPort := func(target int) bool {
+		for _, p := range openPorts {
+			if p == target {
+				return true
+			}
+		}
+		return false
+	}
+
+	if hasPort(8291) {
+		return "MikroTik RouterOS", "v7 (WinBox 8291)", "core-router"
+	}
+	if hasPort(5985) || hasPort(5986) || hasPort(3389) || hasPort(445) || hasPort(135) {
+		if hasPort(5985) || hasPort(5986) {
+			return "Windows Server", "WinRM Enabled", "server"
+		}
+		return "Windows", "NT SMB/RDP Endpoint", "workstation"
+	}
+	if hasPort(22) {
+		return "Ubuntu Linux", "SSH Open (Port 22)", "server"
+	}
+	if hasPort(80) || hasPort(443) || hasPort(8080) || hasPort(3000) {
+		return "Linux / Network Appliance", "HTTP/HTTPS Service", "server"
+	}
+	return "Network Endpoint", "ICMP Echo Responder", "workstation"
+}
+
+func detectLocalOSStrings() (string, string) {
+	switch runtime.GOOS {
+	case "windows":
+		return "Windows", runtime.GOARCH
+	case "darwin":
+		return "macOS Sequoia", runtime.GOARCH
+	default:
+		return "Ubuntu Linux", runtime.GOARCH
+	}
+}
+
+// ============================================================================
+// 10. CREDENTIAL VAULT & REMOTE AGENT PUSH DEPLOYMENT HANDLERS
+// ============================================================================
 
 func (s *VectraNetServer) handleCredentials(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -1012,7 +1569,7 @@ func maxInt(a, b int) int {
 }
 
 // ============================================================================
-// 8. MAIN ENTRY POINT
+// 11. MAIN ENTRY POINT
 // ============================================================================
 
 func main() {
@@ -1057,6 +1614,7 @@ func main() {
 	mux.HandleFunc("/api/v1/metrics", server.handleGetMetrics)
 	mux.HandleFunc("/api/v1/agent/ingest", server.handleAgentIngest)
 	mux.HandleFunc("/api/v1/scan", server.handleSubnetScan)
+	mux.HandleFunc("/api/v1/scan/status", server.handleGetScanStatus)
 	mux.HandleFunc("/api/v1/credentials", server.handleCredentials)
 	mux.HandleFunc("/api/v1/deploy", server.handlePushDeploy)
 
@@ -1074,8 +1632,8 @@ func main() {
 		Addr:              listenAddr,
 		Handler:           withCORS(mux),
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 
