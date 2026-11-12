@@ -36,11 +36,30 @@ interface PushDeployModalProps {
 
 const DEFAULT_POWERSHELL_FIREWALL_FIX = `Enable-PSRemoting -Force; Set-Item WSMan:\\localhost\\Client\\TrustedHosts -Value '*' -Force; reg add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System /v LocalAccountTokenFilterPolicy /t REG_DWORD /d 1 /f; Enable-NetFirewallRule -DisplayGroup "Windows Management Instrumentation (WMI)","Windows Remote Management" -ErrorAction SilentlyContinue; New-NetFirewallRule -DisplayName "VectraNet-RMM-Ports" -Direction Inbound -LocalPort 5985,5986,135,445 -Protocol TCP -Action Allow`;
 
-function buildManualAgentOneLiner(serverOrigin: string, targetIp?: string): string {
+function buildManualAgentOneLiner(
+  serverOrigin: string,
+  targetIp?: string,
+  detectedServerLanIp?: string
+): string {
+  let cleanOrigin = serverOrigin.replace(/\/+$/, '');
+  if (
+    detectedServerLanIp &&
+    detectedServerLanIp !== '127.0.0.1' &&
+    /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(cleanOrigin)
+  ) {
+    cleanOrigin = cleanOrigin.replace(/\/\/(localhost|127\.0\.0\.1)/i, `//${detectedServerLanIp}`);
+  }
+  const altOrigin = cleanOrigin.endsWith(':8080')
+    ? cleanOrigin.replace(/:8080$/, ':3000')
+    : cleanOrigin.endsWith(':3000')
+    ? cleanOrigin.replace(/:3000$/, ':8080')
+    : `${cleanOrigin}:8080`;
+
   const ipExpr = targetIp
     ? `'${targetIp}'`
     : `(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } | Select-Object -First 1).IPAddress`;
-  return `$srv='${serverOrigin}'; $cs=Get-CimInstance Win32_ComputerSystem; $os=Get-CimInstance Win32_OperatingSystem; $cpu=@(Get-CimInstance Win32_Processor)[0]; $dk=Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"; $body=@{agent_version='v2.4.2-ps-manual';hostname=$env:COMPUTERNAME;ip_address=${ipExpr};os_family='Windows';os_version=$os.Caption;kernel_arch='windows/amd64';cpu_model=$cpu.Name;cpu_cores=[int]$cs.NumberOfLogicalProcessors;cpu_usage_pct=[double]$cpu.LoadPercentage;ram_total_gb=[math]::Round($os.TotalVisibleMemorySize/1MB,2);ram_used_gb=[math]::Round(($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)/1MB,2);disk_total_gb=[math]::Round($dk.Size/1GB,2);disk_used_gb=[math]::Round(($dk.Size-$dk.FreeSpace)/1GB,2);agent_rss_mb=11.8} | ConvertTo-Json -Compress; Invoke-RestMethod -Uri "$srv/api/v1/agent/ingest" -Method Post -ContentType 'application/json' -Body $body`;
+
+  return `$ErrorActionPreference='Continue'; $srvs=@('${cleanOrigin}','${altOrigin}'); $cs=Get-CimInstance Win32_ComputerSystem; $os=Get-CimInstance Win32_OperatingSystem; $cpus=@(Get-CimInstance Win32_Processor); $dk=Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"; $nic=@(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True" | Where-Object { $_.MACAddress })[0]; $mac=if($nic -and $nic.MACAddress){($nic.MACAddress -replace '-',':').ToUpper()}else{'02:56:00:00:00:01'}; $load=($cpus | Measure-Object -Property LoadPercentage -Average).Average; if($null -eq $load){$load=2.5}; $cores=0; foreach($c in $cpus){$cores+=[int]$c.NumberOfLogicalProcessors}; if($cores -lt 1){$cores=1}; $ip=${ipExpr}; $body=@{agent_version='v2.4.2-ps-direct';hostname=$env:COMPUTERNAME;ip_address=$ip;mac_address=$mac;os_family='Windows';os_version=[string]$os.Caption;kernel_arch='windows/amd64';cpu_model=[string]$cpus[0].Name;cpu_cores=[int]$cores;cpu_usage_pct=[math]::Round([double]$load,2);ram_total_gb=[math]::Round($os.TotalVisibleMemorySize/1MB,2);ram_used_gb=[math]::Round(($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)/1MB,2);disk_total_gb=[math]::Round($dk.Size/1GB,2);disk_used_gb=[math]::Round(($dk.Size-$dk.FreeSpace)/1GB,2);agent_rss_mb=12.4} | ConvertTo-Json -Compress; $ok=$false; foreach($u in $srvs){ try { $res=Invoke-RestMethod -Uri "$u/api/v1/agent/ingest" -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 8 -ErrorAction Stop; Write-Host "[OK] VectraNet Agent Aktif di $env:COMPUTERNAME ($ip) -> Terhubung ke $u" -ForegroundColor Green; $ok=$true; break } catch {} }; if(-not $ok){ Write-Warning "Gagal menghubungi server $srvs. Pastikan PC ini dapat mengakses IP server pusat." }`;
 }
 
 export const PushDeployModal: React.FC<PushDeployModalProps> = ({
@@ -61,6 +80,7 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
   const [stepLogs, setStepLogs] = useState<string[]>([]);
   const [copiedFirewallCmd, setCopiedFirewallCmd] = useState(false);
   const [copiedManualAgentCmd, setCopiedManualAgentCmd] = useState(false);
+  const [serverLanIp, setServerLanIp] = useState<string>('');
 
   // Reset modal execution state ONLY when modal opens or target device list changes
   const targetKey = targetDevices.map((d) => `${d.id}:${d.ipAddress}`).join(',');
@@ -73,6 +93,20 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
       setStepLogs([]);
       setCopiedFirewallCmd(false);
       setCopiedManualAgentCmd(false);
+
+      fetch('/api/v1/network/local-cidr')
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data) => {
+          if (data?.serverIp && data.serverIp !== '127.0.0.1') {
+            setServerLanIp(String(data.serverIp));
+          } else if (Array.isArray(data?.interfaces)) {
+            const found = data.interfaces.find(
+              (iface: { ip?: string }) => iface.ip && !iface.ip.startsWith('127.')
+            );
+            if (found?.ip) setServerLanIp(String(found.ip));
+          }
+        })
+        .catch(() => {});
     }
   }, [isOpen, targetKey]);
 
@@ -96,7 +130,16 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
       ? window.location.origin
       : 'http://localhost:8080';
   const primaryTargetIp = targetDevices.length === 1 ? targetDevices[0].ipAddress : undefined;
-  const manualInstallScript = buildManualAgentOneLiner(serverOrigin, primaryTargetIp);
+
+  // Prefer backend-generated [MANUAL-INSTALL] command if present in stepLogs so it always uses the exact Go backend LAN IP
+  const backendManualLog = stepLogs.find((l) => l.includes('[MANUAL-INSTALL]'));
+  const extractedBackendScript = backendManualLog
+    ? backendManualLog.replace(/^.*?:\s*(\$ErrorActionPreference|\$srv=)/, '$1')
+    : '';
+  const manualInstallScript =
+    extractedBackendScript && extractedBackendScript.startsWith('$')
+      ? extractedBackendScript
+      : buildManualAgentOneLiner(serverOrigin, primaryTargetIp, serverLanIp);
 
   const handleCopyText = async (text: string, type: 'firewall' | 'manual') => {
     try {
@@ -143,7 +186,7 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
       `[00.1s] Mengirim instruksi Push Deployment ke backend (/api/v1/deploy)...`,
       `[00.1s] Target Dinamis: ${targetListStr}`,
       `[00.1s] Kredensial Universal: "${selectedCred.label}" [User: ${selectedCred.username} | Protokol: ${selectedCred.protocol} (Port Standar: ${stdPort})]`,
-      `[00.2s] [SMART-PROBE] Memetakan port sesuai protokol standar (5986/WinRM-HTTPS, 5985/WinRM-HTTP, 135/DCOM-RPC, 445/Native-Go-SMB-Service, 22/SSH)...`,
+      `[00.2s] [SMART-PROBE] Memetakan port standar (5986/WinRM-HTTPS, 5985/WinRM-HTTP) + Auto-Fallback Injeksi SMB Share (C$\\Windows\\Temp) & Remote SCM Service (Port 445/135)...`,
     ]);
 
     try {
@@ -326,10 +369,18 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
             <div className="p-3.5 rounded-lg bg-[#0B0F17] border border-[#1E293B] font-mono text-[11px] space-y-1.5 max-h-44 overflow-y-auto">
               {stepLogs.map((line, idx) => {
                 const isErr = line.includes('[ERROR]');
-                const isOk = line.includes('[OK]') || line.includes('[SUCCESS]');
-                const isProbe = line.includes('[SMART-PROBE]');
+                const isOk =
+                  line.includes('[OK]') ||
+                  line.includes('[SUCCESS]') ||
+                  line.includes('[SMB-SCM-SUCCESS]');
+                const isProbe =
+                  line.includes('[SMART-PROBE]') ||
+                  line.includes('[SMB2-NTLMSSP]') ||
+                  line.includes('[DCE-RPC-135]');
                 const isFallback =
-                  line.includes('[AUTO-FALLBACK]') || line.includes('[SMB-RPC-NATIVE]');
+                  line.includes('[AUTO-FALLBACK]') ||
+                  line.includes('[SMB-RPC-NATIVE]') ||
+                  line.includes('[SMB-RPC-FALLBACK]');
                 const isRemediation =
                   line.includes('[REMEDIATION-POWERSHELL]') || line.includes('[MANUAL-INSTALL]');
                 return (

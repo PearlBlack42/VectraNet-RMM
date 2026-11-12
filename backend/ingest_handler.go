@@ -797,19 +797,28 @@ func (s *VectraNetServer) handleGetDevices(w http.ResponseWriter, r *http.Reques
 		devices = append(devices, dev)
 	}
 
-	// Clean any legacy 'HOST-...' prefix immediately and trigger non-blocking background resolution
-	// for any device whose hostname is still just its IP address
+	// Clean any legacy 'HOST-...' prefix immediately in memory & DB, and trigger non-blocking
+	// rate-limited background resolution for any device whose hostname is still its raw IP address
 	for idx := range devices {
 		hName := strings.TrimSpace(devices[idx].Hostname)
 		if hName == "" || strings.HasPrefix(strings.ToUpper(hName), "HOST-") {
 			devices[idx].Hostname = devices[idx].IPAddress
 			hName = devices[idx].IPAddress
+			devID := devices[idx].ID
+			devIP := devices[idx].IPAddress
+			go func(id, ip string) {
+				bgCtx, bgCancel := context.WithTimeout(context.Background(), 3*time.Second)
+				_, _ = s.dbPool.Exec(bgCtx, `UPDATE devices SET hostname = $2 WHERE id = $1::uuid AND UPPER(hostname) LIKE 'HOST-%'`, id, ip)
+				bgCancel()
+			}(devID, devIP)
 		}
 		if hName == devices[idx].IPAddress {
 			devID := devices[idx].ID
 			devIP := devices[idx].IPAddress
 			go func(id, ip string) {
-				resolved := resolveReverseDNS(ip, 1500*time.Millisecond)
+				acquireHostnameResolverSlot()
+				defer releaseHostnameResolverSlot()
+				resolved := resolveReverseDNS(ip, 2200*time.Millisecond)
 				if resolved != "" && resolved != ip && !strings.HasPrefix(strings.ToUpper(resolved), "HOST-") {
 					bgCtx, bgCancel := context.WithTimeout(context.Background(), 3*time.Second)
 					_, _ = s.dbPool.Exec(bgCtx, `
@@ -1045,19 +1054,38 @@ func (s *VectraNetServer) handleAgentIngest(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	if payload.MACAddress == "" || payload.Hostname == "" {
-		http.Error(w, `{"error":"hostname and mac_address are required"}`, http.StatusUnprocessableEntity)
-		return
-	}
-
 	// Resolve real sender IP if payload IP is empty or loopback
 	if payload.IPAddress == "" || payload.IPAddress == "127.0.0.1" {
-		if remoteHost, _, err := net.SplitHostPort(r.RemoteAddr); err == nil && remoteHost != "" && remoteHost != "::1" {
+		if remoteHost, _, err := net.SplitHostPort(r.RemoteAddr); err == nil && remoteHost != "" && remoteHost != "::1" && remoteHost != "127.0.0.1" {
 			payload.IPAddress = remoteHost
 		} else if payload.IPAddress == "" {
 			payload.IPAddress = "127.0.0.1"
 		}
 	}
+
+	if strings.TrimSpace(payload.Hostname) == "" || strings.HasPrefix(strings.ToUpper(strings.TrimSpace(payload.Hostname)), "HOST-") {
+		if resolved := resolveReverseDNS(payload.IPAddress, 1500*time.Millisecond); resolved != "" {
+			payload.Hostname = resolved
+		} else {
+			payload.Hostname = payload.IPAddress
+		}
+	}
+
+	// Auto-resolve MAC address if omitted by manual PowerShell 1-liner so ingest never fails with 422
+	if strings.TrimSpace(payload.MACAddress) == "" || !isValidMAC(normalizeMAC(payload.MACAddress)) {
+		var existingMAC string
+		reqCtx, reqCancel := context.WithTimeout(r.Context(), 2*time.Second)
+		_ = s.dbPool.QueryRow(reqCtx, `SELECT mac_address::text FROM devices WHERE host(ip_address) = $1 LIMIT 1`, payload.IPAddress).Scan(&existingMAC)
+		reqCancel()
+		if isValidMAC(normalizeMAC(existingMAC)) {
+			payload.MACAddress = normalizeMAC(existingMAC)
+		} else if arpMAC, ok := readOSArpTable()[payload.IPAddress]; ok && isValidMAC(normalizeMAC(arpMAC)) {
+			payload.MACAddress = normalizeMAC(arpMAC)
+		} else {
+			payload.MACAddress = deriveDeterministicMACFromIP(payload.IPAddress)
+		}
+	}
+
 	if payload.RecordedAt.IsZero() {
 		payload.RecordedAt = time.Now().UTC()
 	}
@@ -2051,14 +2079,29 @@ func deriveDeterministicMACFromIP(ipStr string) string {
 	return "02:56:00:00:00:01"
 }
 
+var (
+	hostnameResolverSem = make(chan struct{}, 8)
+	nbtstatCmdMu        sync.Mutex
+)
+
+func acquireHostnameResolverSlot() {
+	hostnameResolverSem <- struct{}{}
+}
+
+func releaseHostnameResolverSlot() {
+	<-hostnameResolverSem
+}
+
 // resolveReverseDNS resolves the real, unique device hostname for an IPv4 address using concurrent
 // multi-protocol probes:
 //   1. Reverse DNS PTR (net.DefaultResolver.LookupAddr)
 //   2. SMB2 NTLMSSP Challenge TargetInfo over TCP 445 (MsvAvDnsComputerName / MsvAvNbComputerName)
-//   3. WinRM / HTTP NTLMSSP Challenge TargetInfo over TCP 5985 / 80
-//   4. NetBIOS Node Status (RFC 1002 NBSTAT) over UDP 137
-//   5. mDNS Reverse PTR over UDP 5353 (unicast & multicast)
-//   6. OS Native Resolver (Windows ping -a / nbtstat -A with dedicated contexts, Linux/macOS getent)
+//   3. WinRM / HTTP NTLMSSP Challenge TargetInfo over TCP 5985
+//   4. NetBIOS Node Status (RFC 1002 NBSTAT) over UDP 137 (with dual-packet burst)
+//   5. LLMNR (Link-Local Multicast Name Resolution, RFC 4795) Reverse PTR over UDP 5355
+//   6. mDNS Reverse PTR over UDP 5353 (unicast QU & multicast 224.0.0.251)
+//   7. OS Native Resolver (Windows ping -a / serialized nbtstat -A, Linux/macOS getent)
+// Never returns a synthetic HOST-172-... name.
 func resolveReverseDNS(ip string, timeout time.Duration) string {
 	if isLocalIPAddress(ip) {
 		if h, err := os.Hostname(); err == nil && strings.TrimSpace(h) != "" {
@@ -2066,15 +2109,15 @@ func resolveReverseDNS(ip string, timeout time.Duration) string {
 		}
 	}
 
-	if timeout < 800*time.Millisecond {
-		timeout = 1200 * time.Millisecond
+	if timeout < 1000*time.Millisecond {
+		timeout = 1400 * time.Millisecond
 	}
 
 	type resultItem struct {
 		priority int
 		name     string
 	}
-	resCh := make(chan resultItem, 6)
+	resCh := make(chan resultItem, 7)
 	var wg sync.WaitGroup
 
 	// 1. Standard Reverse DNS PTR (net.DefaultResolver.LookupAddr)
@@ -2127,24 +2170,35 @@ func resolveReverseDNS(ip string, timeout time.Duration) string {
 		}
 	}()
 
-	// 5. Unicast / Multicast mDNS Reverse PTR Query (UDP port 5353)
+	// 5. LLMNR Reverse PTR Query (RFC 4795 over UDP port 5355 - Windows 10/11 native hostname resolution)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if mdnsName := queryMDNSHostname(ip, timeout); mdnsName != "" {
-			if clean := sanitizeResolvedHostname(mdnsName, ip); clean != "" {
+		if llmnrName := queryLLMNRHostname(ip, timeout); llmnrName != "" {
+			if clean := sanitizeResolvedHostname(llmnrName, ip); clean != "" {
 				resCh <- resultItem{priority: 5, name: clean}
 			}
 		}
 	}()
 
-	// 6. OS Command Fallback (Windows ping -a / nbtstat -A, Linux/macOS getent hosts)
+	// 6. Unicast / Multicast mDNS Reverse PTR Query (UDP port 5353)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if mdnsName := queryMDNSHostname(ip, timeout); mdnsName != "" {
+			if clean := sanitizeResolvedHostname(mdnsName, ip); clean != "" {
+				resCh <- resultItem{priority: 6, name: clean}
+			}
+		}
+	}()
+
+	// 7. OS Command Fallback (Windows ping -a / mutex-serialized nbtstat -A, Linux/macOS getent hosts)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		if osName := resolveOSCommandHostname(ip, timeout); osName != "" {
 			if clean := sanitizeResolvedHostname(osName, ip); clean != "" {
-				resCh <- resultItem{priority: 6, name: clean}
+				resCh <- resultItem{priority: 7, name: clean}
 			}
 		}
 	}()
@@ -2403,7 +2457,8 @@ func minDuration(a, b time.Duration) time.Duration {
 }
 
 // queryNetBIOSName sends an RFC 1002 NetBIOS Node Status (NBSTAT) UDP packet to <ip>:137
-// and extracts the unique workstation/server NetBIOS name (e.g., edp06, edp07).
+// (with a second burst after 60ms so ARP resolution never drops the query) and extracts
+// the unique workstation/server NetBIOS name (e.g., edp06, edp07, DESKTOP-XXXX).
 func queryNetBIOSName(ip string, timeout time.Duration) string {
 	conn, err := net.DialTimeout("udp", net.JoinHostPort(ip, "137"), timeout)
 	if err != nil {
@@ -2431,6 +2486,10 @@ func queryNetBIOSName(ip string, timeout time.Duration) string {
 	if _, err := conn.Write(packet); err != nil {
 		return ""
 	}
+	go func() {
+		time.Sleep(65 * time.Millisecond)
+		_, _ = conn.Write(packet)
+	}()
 
 	buf := make([]byte, 512)
 	n, err := conn.Read(buf)
@@ -2492,11 +2551,11 @@ func queryNetBIOSName(ip string, timeout time.Duration) string {
 	return fallbackCandidate
 }
 
-// queryMDNSHostname sends a reverse PTR DNS query over UDP port 5353 to resolve .local hostnames.
-func queryMDNSHostname(ip string, timeout time.Duration) string {
+// buildReversePTRQueryPacket constructs a DNS reverse PTR packet for <d>.<c>.<b>.<a>.in-addr.arpa.
+func buildReversePTRQueryPacket(ip string, txID uint16, unicastResponseBit bool) ([]byte, bool) {
 	parsed := net.ParseIP(ip)
 	if parsed == nil || parsed.To4() == nil {
-		return ""
+		return nil, false
 	}
 	b := parsed.To4()
 	labels := []string{
@@ -2509,9 +2568,10 @@ func queryMDNSHostname(ip string, timeout time.Duration) string {
 	}
 
 	var pkt bytes.Buffer
+	pkt.WriteByte(byte(txID >> 8))
+	pkt.WriteByte(byte(txID & 0xFF))
 	pkt.Write([]byte{
-		0x12, 0x34, // ID
-		0x00, 0x00, // Standard query
+		0x00, 0x00, // Flags: standard query
 		0x00, 0x01, // QDCOUNT = 1
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	})
@@ -2520,25 +2580,19 @@ func queryMDNSHostname(ip string, timeout time.Duration) string {
 		pkt.WriteString(lbl)
 	}
 	pkt.WriteByte(0x00)
+	qclassHi := byte(0x00)
+	if unicastResponseBit {
+		qclassHi = 0x80 // QU bit requesting unicast response
+	}
 	pkt.Write([]byte{
 		0x00, 0x0C, // QTYPE = PTR (12)
-		0x00, 0x01, // QCLASS = IN (1)
+		qclassHi, 0x01, // QCLASS = IN (1)
 	})
+	return pkt.Bytes(), true
+}
 
-	conn, err := net.DialTimeout("udp", net.JoinHostPort(ip, "5353"), timeout)
-	if err != nil {
-		return ""
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(timeout))
-
-	if _, err := conn.Write(pkt.Bytes()); err != nil {
-		return ""
-	}
-
-	resp := make([]byte, 512)
-	n, err := conn.Read(resp)
-	if err != nil || n < 12 {
+func parseDNSPTRResponsePacket(resp []byte, n int) string {
+	if n < 12 {
 		return ""
 	}
 	ancount := binary.BigEndian.Uint16(resp[6:8])
@@ -2546,7 +2600,6 @@ func queryMDNSHostname(ip string, timeout time.Duration) string {
 		return ""
 	}
 
-	// Skip header (12) and question section
 	pos := 12
 	for pos < n && resp[pos] != 0 {
 		if (resp[pos] & 0xC0) == 0xC0 {
@@ -2559,7 +2612,6 @@ func queryMDNSHostname(ip string, timeout time.Duration) string {
 afterQuestion:
 	pos += 4 // QTYPE + QCLASS
 
-	// Read first answer RR
 	if pos >= n {
 		return ""
 	}
@@ -2581,8 +2633,67 @@ afterAnswerName:
 	if rtype != 12 || pos+rdLen > n {
 		return ""
 	}
-
 	return decodeDNSName(resp[:n], pos)
+}
+
+// queryLLMNRHostname sends an RFC 4795 Link-Local Multicast Name Resolution (LLMNR) reverse PTR query
+// over UDP port 5355 (both directly to <ip>:5355 and to multicast 224.0.0.252:5355) to resolve Windows
+// workgroup hostnames when NetBIOS or DNS PTR is unavailable.
+func queryLLMNRHostname(ip string, timeout time.Duration) string {
+	pkt, ok := buildReversePTRQueryPacket(ip, 0x5355, false)
+	if !ok {
+		return ""
+	}
+
+	pconn, err := net.ListenPacket("udp4", ":0")
+	if err != nil {
+		return ""
+	}
+	defer pconn.Close()
+	_ = pconn.SetDeadline(time.Now().Add(minDuration(timeout, 950*time.Millisecond)))
+
+	if uAddr, err := net.ResolveUDPAddr("udp4", net.JoinHostPort(ip, "5355")); err == nil {
+		_, _ = pconn.WriteTo(pkt, uAddr)
+	}
+	if mAddr, err := net.ResolveUDPAddr("udp4", "224.0.0.252:5355"); err == nil {
+		_, _ = pconn.WriteTo(pkt, mAddr)
+	}
+
+	resp := make([]byte, 512)
+	n, _, err := pconn.ReadFrom(resp)
+	if err != nil || n < 12 {
+		return ""
+	}
+	return parseDNSPTRResponsePacket(resp, n)
+}
+
+// queryMDNSHostname sends a reverse PTR DNS query over UDP port 5353 (unicast QU & multicast 224.0.0.251:5353).
+func queryMDNSHostname(ip string, timeout time.Duration) string {
+	pkt, ok := buildReversePTRQueryPacket(ip, 0x5353, true)
+	if !ok {
+		return ""
+	}
+
+	pconn, err := net.ListenPacket("udp4", ":0")
+	if err != nil {
+		return ""
+	}
+	defer pconn.Close()
+	_ = pconn.SetDeadline(time.Now().Add(minDuration(timeout, 950*time.Millisecond)))
+
+	if uAddr, err := net.ResolveUDPAddr("udp4", net.JoinHostPort(ip, "5353")); err == nil {
+		_, _ = pconn.WriteTo(pkt, uAddr)
+	}
+	if mAddr, err := net.ResolveUDPAddr("udp4", "224.0.0.251:5353"); err == nil {
+		_, _ = pconn.WriteTo(pkt, mAddr)
+	}
+
+	resp := make([]byte, 512)
+	n, _, err := pconn.ReadFrom(resp)
+	if err != nil || n < 12 {
+		return ""
+	}
+	return parseDNSPTRResponsePacket(resp, n)
 }
 
 func decodeDNSName(msg []byte, offset int) string {
@@ -2616,18 +2727,18 @@ var nbtstatRowRegex = regexp.MustCompile(`(?m)^\s*([A-Za-z0-9\-_]{1,15})\s+<(?:0
 
 func resolveOSCommandHostname(ip string, timeout time.Duration) string {
 	if runtime.GOOS == "windows" {
-		// Run 'nbtstat -A <ip>' and 'ping -a -n 1 -w 250 <ip>' concurrently with independent contexts
-		// so one slow command never cancels the other!
+		// 1. Run 'ping -a -n 1 -w 300 <ip>' (uses Windows native DNS/LLMNR/NetBT name resolver without locking NetBT)
 		resCh := make(chan string, 2)
 		var wg sync.WaitGroup
 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			nbtCtx, nbtCancel := context.WithTimeout(context.Background(), timeout+600*time.Millisecond)
-			defer nbtCancel()
-			nbtOut, _ := exec.CommandContext(nbtCtx, "nbtstat", "-A", ip).CombinedOutput()
-			if m := nbtstatRowRegex.FindStringSubmatch(string(nbtOut)); len(m) >= 2 {
+			pingCtx, pingCancel := context.WithTimeout(context.Background(), timeout+900*time.Millisecond)
+			defer pingCancel()
+			out, _ := exec.CommandContext(pingCtx, "ping", "-a", "-n", "1", "-w", "300", ip).CombinedOutput()
+			re := regexp.MustCompile(`([^\s\[\]:]+)\s+\[` + regexp.QuoteMeta(ip) + `\]`)
+			if m := re.FindStringSubmatch(string(out)); len(m) >= 2 {
 				candidate := strings.TrimSpace(m[1])
 				if candidate != "" && candidate != ip {
 					resCh <- candidate
@@ -2635,15 +2746,16 @@ func resolveOSCommandHostname(ip string, timeout time.Duration) string {
 			}
 		}()
 
+		// 2. Run mutex-serialized 'nbtstat -A <ip>' so concurrent subnet-scan goroutines never collide on the Windows NetBT driver
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			pingCtx, pingCancel := context.WithTimeout(context.Background(), timeout+900*time.Millisecond)
-			defer pingCancel()
-			out, _ := exec.CommandContext(pingCtx, "ping", "-a", "-n", "1", "-w", "250", ip).CombinedOutput()
-			// Match token immediately preceding [<ip>] regardless of Windows UI language
-			re := regexp.MustCompile(`([^\s\[\]:]+)\s+\[` + regexp.QuoteMeta(ip) + `\]`)
-			if m := re.FindStringSubmatch(string(out)); len(m) >= 2 {
+			nbtstatCmdMu.Lock()
+			defer nbtstatCmdMu.Unlock()
+			nbtCtx, nbtCancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+			defer nbtCancel()
+			nbtOut, _ := exec.CommandContext(nbtCtx, "nbtstat", "-A", ip).CombinedOutput()
+			if m := nbtstatRowRegex.FindStringSubmatch(string(nbtOut)); len(m) >= 2 {
 				candidate := strings.TrimSpace(m[1])
 				if candidate != "" && candidate != ip {
 					resCh <- candidate
@@ -2906,13 +3018,74 @@ func buildPowerShellRemediationGuide(targetIP string) string {
 	)
 }
 
-// buildManualPowerShellAgentOneLiner returns a single-line PowerShell command that can be executed
-// directly on the target Windows PC to read real CPU/RAM/Disk hardware metrics and push them
-// to /api/v1/agent/ingest when incoming ports on the target are blocked by firewall.
+// resolveServerLANOriginForTarget determines the central server's reachable LAN IPv4 origin
+// (e.g. "http://172.27.170.16:8080") for a given targetIP so remote agents and manual PowerShell
+// 1-liners never try to send telemetry to "localhost" or "127.0.0.1" on the remote machine.
+func resolveServerLANOriginForTarget(targetIP, reqHost string) string {
+	hostPart, portPart, err := net.SplitHostPort(strings.TrimSpace(reqHost))
+	if err != nil {
+		hostPart = strings.TrimSpace(reqHost)
+		portPart = "8080"
+	}
+	if portPart == "" {
+		portPart = "8080"
+	}
+
+	isLoopbackHost := hostPart == "" ||
+		strings.EqualFold(hostPart, "localhost") ||
+		strings.HasPrefix(hostPart, "127.") ||
+		hostPart == "::1" ||
+		hostPart == "0.0.0.0"
+
+	if !isLoopbackHost {
+		return fmt.Sprintf("http://%s:%s", hostPart, portPart)
+	}
+
+	// Probe outbound UDP routing table toward targetIP (no packet is actually needed to learn local interface IP)
+	probeDest := targetIP
+	if net.ParseIP(probeDest) == nil || isLocalIPAddress(probeDest) {
+		probeDest = "8.8.8.8"
+	}
+	if conn, dErr := net.DialTimeout("udp4", net.JoinHostPort(probeDest, "80"), 400*time.Millisecond); dErr == nil {
+		if udpAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok && udpAddr.IP != nil && !udpAddr.IP.IsLoopback() {
+			_ = conn.Close()
+			return fmt.Sprintf("http://%s:%s", udpAddr.IP.String(), portPart)
+		}
+		_ = conn.Close()
+	}
+
+	// Fallback: inspect active non-loopback IPv4 interfaces
+	if ifaces, iErr := net.Interfaces(); iErr == nil {
+		for _, iface := range ifaces {
+			if (iface.Flags&net.FlagUp) == 0 || (iface.Flags&net.FlagLoopback) != 0 {
+				continue
+			}
+			addrs, _ := iface.Addrs()
+			for _, addr := range addrs {
+				if ipNet, ok := addr.(*net.IPNet); ok && ipNet.IP != nil && ipNet.IP.To4() != nil && !ipNet.IP.IsLoopback() {
+					return fmt.Sprintf("http://%s:%s", ipNet.IP.To4().String(), portPart)
+				}
+			}
+		}
+	}
+
+	return fmt.Sprintf("http://%s:%s", firstNonEmpty(hostPart, "127.0.0.1"), portPart)
+}
+
+// buildManualPowerShellAgentOneLiner returns a resilient single-line PowerShell command that can be executed
+// directly on the target Windows PC to read real CPU/RAM/Disk/MAC hardware metrics, register a background
+// heartbeat task, and immediately push telemetry to /api/v1/agent/ingest using the server's LAN IP.
 func buildManualPowerShellAgentOneLiner(serverOrigin, targetIP string) string {
+	cleanOrigin := strings.TrimRight(strings.TrimSpace(serverOrigin), "/")
+	altOrigin := cleanOrigin
+	if strings.HasSuffix(cleanOrigin, ":8080") {
+		altOrigin = strings.TrimSuffix(cleanOrigin, ":8080") + ":3000"
+	} else if strings.HasSuffix(cleanOrigin, ":3000") {
+		altOrigin = strings.TrimSuffix(cleanOrigin, ":3000") + ":8080"
+	}
 	return fmt.Sprintf(
-		`$srv='%s'; $cs=Get-CimInstance Win32_ComputerSystem; $os=Get-CimInstance Win32_OperatingSystem; $cpu=@(Get-CimInstance Win32_Processor)[0]; $dk=Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"; $body=@{agent_version='v2.4.2-ps-manual';hostname=$env:COMPUTERNAME;ip_address='%s';os_family='Windows';os_version=$os.Caption;kernel_arch='windows/amd64';cpu_model=$cpu.Name;cpu_cores=[int]$cs.NumberOfLogicalProcessors;cpu_usage_pct=[double]$cpu.LoadPercentage;ram_total_gb=[math]::Round($os.TotalVisibleMemorySize/1MB,2);ram_used_gb=[math]::Round(($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)/1MB,2);disk_total_gb=[math]::Round($dk.Size/1GB,2);disk_used_gb=[math]::Round(($dk.Size-$dk.FreeSpace)/1GB,2);agent_rss_mb=11.8} | ConvertTo-Json -Compress; Invoke-RestMethod -Uri "$srv/api/v1/agent/ingest" -Method Post -ContentType 'application/json' -Body $body`,
-		serverOrigin, targetIP,
+		`$ErrorActionPreference='Continue'; $srvs=@('%s','%s'); $cs=Get-CimInstance Win32_ComputerSystem; $os=Get-CimInstance Win32_OperatingSystem; $cpus=@(Get-CimInstance Win32_Processor); $dk=Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"; $nic=@(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True" | Where-Object { $_.MACAddress })[0]; $mac=if($nic -and $nic.MACAddress){($nic.MACAddress -replace '-',':').ToUpper()}else{'02:56:00:00:00:01'}; $load=($cpus | Measure-Object -Property LoadPercentage -Average).Average; if($null -eq $load){$load=2.5}; $cores=0; foreach($c in $cpus){$cores+=[int]$c.NumberOfLogicalProcessors}; if($cores -lt 1){$cores=1}; $body=@{agent_version='v2.4.2-ps-direct';hostname=$env:COMPUTERNAME;ip_address='%s';mac_address=$mac;os_family='Windows';os_version=[string]$os.Caption;kernel_arch='windows/amd64';cpu_model=[string]$cpus[0].Name;cpu_cores=[int]$cores;cpu_usage_pct=[math]::Round([double]$load,2);ram_total_gb=[math]::Round($os.TotalVisibleMemorySize/1MB,2);ram_used_gb=[math]::Round(($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)/1MB,2);disk_total_gb=[math]::Round($dk.Size/1GB,2);disk_used_gb=[math]::Round(($dk.Size-$dk.FreeSpace)/1GB,2);agent_rss_mb=12.4} | ConvertTo-Json -Compress; $ok=$false; foreach($u in $srvs){ try { $res=Invoke-RestMethod -Uri "$u/api/v1/agent/ingest" -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 8 -ErrorAction Stop; Write-Host "[OK] VectraNet Agent Aktif di $env:COMPUTERNAME (%s) -> Terhubung ke $u" -ForegroundColor Green; $ok=$true; break } catch {} }; if(-not $ok){ Write-Warning "Gagal menghubungi server $srvs. Pastikan PC ini dapat mengakses IP server pusat." }`,
+		cleanOrigin, altOrigin, targetIP, targetIP,
 	)
 }
 
@@ -2934,15 +3107,23 @@ func querySMB2NTLMTargetName(ip string, timeout ...time.Duration) string {
 	return strings.TrimSpace(raw)
 }
 
-// executeNativeGoSMBRPCServiceDeploy executes a Native Go SMB2 (Port 445) + DCE/RPC Endpoint Mapper (Port 135)
-// handshake and Windows IPC$/SCM Service & WMI probe. It strictly uses Port 445 for SMB2/IPC$ and Port 135 for RPC,
-// never mixing HTTP/HTTPS WinRM onto Port 445.
-func executeNativeGoSMBRPCServiceDeploy(ctx context.Context, targetIP, username, password string, open135, open445 bool) (RealHardwareSnapshot, string, error) {
+// executeNativeGoSMBRPCServiceDeploy executes an automatic multi-stage SMB / RPC / Service Control Manager
+// deployment on TCP Port 445 & 135 when WinRM (5986/5985) is closed or blocked by firewall:
+//   Stage A: Mounts \\<targetIP>\C$\Windows\Temp (or ADMIN$\Temp) via SMB2 (Port 445), copies the silent
+//            VectraNet Agent payload (`vectranet-agent-svc.ps1`), and registers + starts a remote Windows Service
+//            (`VectraNetAgentSvc`) via RPC/Service Control Manager (`sc.exe \\<targetIP> create/start`)
+//            or WMI `Win32_Process.Create` / `schtasks.exe /S <targetIP>` so the agent runs silently in Session 0
+//            without needing WinRM open on the target PC.
+//   Stage B: Falls back to DCOM/RPC (`New-CimSession -Protocol Dcom` on Port 135) or `Get-WmiObject` over IPC$.
+func executeNativeGoSMBRPCServiceDeploy(ctx context.Context, targetIP, username, password, serverOrigin string, open135, open445 bool) (RealHardwareSnapshot, string, []string, error) {
+	stepLogs := make([]string, 0)
+
 	// Step 1: Native Go SMB2 Negotiate + NTLMSSP Challenge on TCP Port 445 to verify SMB service and extract NetBIOS/DNS Computer Name
 	var smbResolvedHost string
 	if open445 {
 		if nbName := querySMB2NTLMTargetName(targetIP, 1200*time.Millisecond); nbName != "" {
 			smbResolvedHost = nbName
+			stepLogs = append(stepLogs, fmt.Sprintf("[SMB2-NTLMSSP] Port 445 merespons -> Identitas mesin target terdeteksi: %s (%s)", smbResolvedHost, targetIP))
 		}
 	}
 
@@ -2968,6 +3149,7 @@ func executeNativeGoSMBRPCServiceDeploy(ctx context.Context, targetIP, username,
 			if n, rErr := conn.Read(resp); rErr == nil && n >= 4 && resp[0] == 0x05 && resp[2] == 0x0c {
 				// 0x0c = MSRPC_BIND_ACK
 				rpcEndpointAlive = true
+				stepLogs = append(stepLogs, fmt.Sprintf("[DCE-RPC-135] Endpoint Mapper MSRPC_BIND_ACK berhasil diverifikasi pada %s:135", targetIP))
 			}
 			_ = conn.Close()
 		}
@@ -2975,21 +3157,23 @@ func executeNativeGoSMBRPCServiceDeploy(ctx context.Context, targetIP, username,
 
 	if runtime.GOOS != "windows" {
 		hostInfo := firstNonEmpty(smbResolvedHost, targetIP)
-		return RealHardwareSnapshot{}, "", fmt.Errorf(
-			"Native Go SMB2 (445=%v) & DCE/RPC BindAck (135=%v) merespons pada %s (%s), namun eksekusi SCM/WMI membutuhkan backend di OS Windows atau jalankan skrip PowerShell 1-baris di target",
+		return RealHardwareSnapshot{}, "", stepLogs, fmt.Errorf(
+			"Native Go SMB2 (445=%v) & DCE/RPC BindAck (135=%v) merespons pada %s (%s), namun injeksi SMB C$/SCM Service membutuhkan backend di OS Windows atau jalankan skrip PowerShell 1-baris di target",
 			open445, rpcEndpointAlive, hostInfo, targetIP,
 		)
 	}
 
-	cmdCtx, cancel := context.WithTimeout(ctx, 14*time.Second)
+	cmdCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
-	// Native Windows IPC$ Session + RPC/SCM/WMI Execution over Port 445 & 135
+	// Multi-Stage SMB Share (\\target\C$\Windows\Temp) + Remote SCM Windows Service Creation (sc.exe \\target create/start)
+	// + WMI Win32_Process.Create + DCOM/WMI Telemetry Collection over Port 445 & 135
 	smbRpcScript := `
 $ErrorActionPreference = 'Stop'
-$targetIp = $env:VECTRANET_TARGET_IP
-$rawUser  = $env:VECTRANET_CRED_USER
-$pass     = $env:VECTRANET_CRED_PASS
+$targetIp   = $env:VECTRANET_TARGET_IP
+$rawUser    = $env:VECTRANET_CRED_USER
+$pass       = $env:VECTRANET_CRED_PASS
+$srvOrigin  = $env:VECTRANET_SERVER_ORIGIN
 
 if ([string]::IsNullOrWhiteSpace($pass)) {
   $secPass = New-Object System.Security.SecureString
@@ -3006,7 +3190,154 @@ $credCandidates += New-Object System.Management.Automation.PSCredential ($rawUse
 
 $errList = @()
 
-# 1. Try DCOM/RPC Session on Port 135
+# =========================================================================================
+# STAGE 1: SMB Share Copy (\\<target>\C$\Windows\Temp) + Remote SCM Service Creation (Port 445/135)
+# =========================================================================================
+foreach ($c in $credCandidates) {
+  $uName = $c.UserName
+  try {
+    $null = & net use "\\$targetIp\IPC$" /delete /y 2>$null
+    $null = & net use "\\$targetIp\C$" /delete /y 2>$null
+    $null = & net use "\\$targetIp\ADMIN$" /delete /y 2>$null
+
+    # Authenticate SMB session to IPC$ / C$
+    $netOut = & net use "\\$targetIp\IPC$" $pass /user:$uName 2>&1
+    if ($LASTEXITCODE -ne 0) {
+      throw "Autentikasi SMB IPC$ gagal: $($netOut -join ' ')"
+    }
+
+    $remoteShareDir = "\\$targetIp\C$\Windows\Temp"
+    $null = & net use "\\$targetIp\C$" $pass /user:$uName 2>&1
+    if (-not (Test-Path $remoteShareDir)) {
+      $null = & net use "\\$targetIp\ADMIN$" $pass /user:$uName 2>&1
+      $remoteShareDir = "\\$targetIp\ADMIN$\Temp"
+    }
+
+    $remotePs1Unc  = Join-Path $remoteShareDir "vectranet-agent-svc.ps1"
+    $remoteJsonUnc = Join-Path $remoteShareDir "vectranet-hw.json"
+
+    if (Test-Path $remoteShareDir) {
+      Remove-Item $remoteJsonUnc -Force -ErrorAction SilentlyContinue
+      $agentPayload = @"
+`$ErrorActionPreference = 'SilentlyContinue'
+`$cs   = Get-CimInstance Win32_ComputerSystem
+`$os   = Get-CimInstance Win32_OperatingSystem
+`$cpus = @(Get-CimInstance Win32_Processor)
+`$disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+`$nic  = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True" | Where-Object { `$_.MACAddress })[0]
+`$mac  = if (`$nic -and `$nic.MACAddress) { (`$nic.MACAddress -replace '-',':').ToUpper() } else { '02:56:00:00:00:01' }
+`$cpuLoad = 0
+if (`$cpus.Count -gt 0) {
+  `$m = (`$cpus | Measure-Object -Property LoadPercentage -Average)
+  if (`$null -ne `$m.Average) { `$cpuLoad = [double]`$m.Average }
+}
+`$cores = 0
+foreach (`$cpu in `$cpus) { `$cores += [int]`$cpu.NumberOfLogicalProcessors }
+if (`$cores -lt 1) { `$cores = 1 }
+`$hwSnap = [PSCustomObject]@{
+  Hostname   = [string]`$env:COMPUTERNAME
+  OSCaption  = [string]`$os.Caption
+  MemTotalKB = [double]`$os.TotalVisibleMemorySize
+  MemFreeKB  = [double]`$os.FreePhysicalMemory
+  CPUName    = [string]`$cpus[0].Name
+  CPUCores   = [int]`$cores
+  CPULoad    = [double]`$cpuLoad
+  DiskSizeB  = [double]`$disk.Size
+  DiskFreeB  = [double]`$disk.FreeSpace
+  Transport  = 'SMB Share (C$\Windows\Temp) + Remote SCM Service (Port 445/135)'
+}
+`$hwSnap | ConvertTo-Json -Compress | Set-Content -Path 'C:\Windows\Temp\vectranet-hw.json' -Encoding UTF8 -Force
+`$ingestBody = @{
+  agent_version = 'v2.4.2-smb-scm'
+  hostname      = [string]`$env:COMPUTERNAME
+  ip_address    = '$targetIp'
+  mac_address   = `$mac
+  os_family     = 'Windows'
+  os_version    = [string]`$os.Caption
+  kernel_arch   = 'windows/amd64'
+  cpu_model     = [string]`$cpus[0].Name
+  cpu_cores     = [int]`$cores
+  cpu_usage_pct = [math]::Round([double]`$cpuLoad, 2)
+  ram_total_gb  = [math]::Round(`$os.TotalVisibleMemorySize/1MB, 2)
+  ram_used_gb   = [math]::Round((`$os.TotalVisibleMemorySize-`$os.FreePhysicalMemory)/1MB, 2)
+  disk_total_gb = [math]::Round(`$disk.Size/1GB, 2)
+  disk_used_gb  = [math]::Round((`$disk.Size-`$disk.FreeSpace)/1GB, 2)
+  agent_rss_mb  = 12.4
+} | ConvertTo-Json -Compress
+try { Invoke-RestMethod -Uri '$srvOrigin/api/v1/agent/ingest' -Method Post -ContentType 'application/json' -Body `$ingestBody -TimeoutSec 6 } catch {}
+"@
+      Set-Content -Path $remotePs1Unc -Value $agentPayload -Encoding UTF8 -Force
+
+      # 1A. Trigger via Remote Windows Service Control Manager (SCM RPC over Port 445/135)
+      $svcBin = 'cmd.exe /c powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\Windows\Temp\vectranet-agent-svc.ps1'
+      $null = & sc.exe "\\$targetIp" stop VectraNetAgentSvc 2>&1
+      $null = & sc.exe "\\$targetIp" delete VectraNetAgentSvc 2>&1
+      $scCreateOut = & sc.exe "\\$targetIp" create VectraNetAgentSvc binPath= "$svcBin" start= demand DisplayName= "VectraNet RMM Telemetry Agent" 2>&1
+      $null = & sc.exe "\\$targetIp" start VectraNetAgentSvc 2>&1
+
+      # 1B. Also trigger via WMI Win32_Process.Create or Scheduled Task if SCM service is still warming up
+      try {
+        Invoke-WmiMethod -ComputerName $targetIp -Credential $c -Class Win32_Process -Name Create -ArgumentList "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\Windows\Temp\vectranet-agent-svc.ps1" -ErrorAction SilentlyContinue | Out-Null
+      } catch {}
+
+      # Wait up to 4.5 seconds for C:\Windows\Temp\vectranet-hw.json to appear via SMB share
+      for ($w = 0; $w -lt 9; $w++) {
+        if (Test-Path $remoteJsonUnc) {
+          $rawJson = Get-Content -Path $remoteJsonUnc -Raw -ErrorAction SilentlyContinue
+          if (-not [string]::IsNullOrWhiteSpace($rawJson)) {
+            $null = & sc.exe "\\$targetIp" delete VectraNetAgentSvc 2>&1
+            $null = & net use "\\$targetIp\C$" /delete /y 2>$null
+            $null = & net use "\\$targetIp\ADMIN$" /delete /y 2>$null
+            $null = & net use "\\$targetIp\IPC$" /delete /y 2>$null
+            Write-Output $rawJson.Trim()
+            exit 0
+          }
+        }
+        Start-Sleep -Milliseconds 500
+      }
+      $null = & sc.exe "\\$targetIp" delete VectraNetAgentSvc 2>&1
+    }
+
+    # 1C. Direct WMI over authenticated SMB/IPC$ session
+    $cs   = Get-WmiObject -ComputerName $targetIp -Credential $c -Class Win32_ComputerSystem -ErrorAction Stop
+    $os   = Get-WmiObject -ComputerName $targetIp -Credential $c -Class Win32_OperatingSystem -ErrorAction Stop
+    $cpus = @(Get-WmiObject -ComputerName $targetIp -Credential $c -Class Win32_Processor -ErrorAction Stop)
+    $disk = Get-WmiObject -ComputerName $targetIp -Credential $c -Class Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction SilentlyContinue
+    $null = & net use "\\$targetIp\C$" /delete /y 2>$null
+    $null = & net use "\\$targetIp\ADMIN$" /delete /y 2>$null
+    $null = & net use "\\$targetIp\IPC$" /delete /y 2>$null
+    $cpuLoadVal = 0
+    if ($cpus.Count -gt 0) {
+      $m = ($cpus | Measure-Object -Property LoadPercentage -Average)
+      if ($null -ne $m.Average) { $cpuLoadVal = [double]$m.Average }
+    }
+    $cores = 0
+    foreach ($cpu in $cpus) { $cores += [int]$cpu.NumberOfLogicalProcessors }
+    if ($cores -lt 1) { $cores = 1 }
+    [PSCustomObject]@{
+      Hostname   = [string]$cs.Name
+      OSCaption  = [string]$os.Caption
+      MemTotalKB = [double]$os.TotalVisibleMemorySize
+      MemFreeKB  = [double]$os.FreePhysicalMemory
+      CPUName    = [string]$cpus[0].Name
+      CPUCores   = [int]$cores
+      CPULoad    = [double]$cpuLoadVal
+      DiskSizeB  = [double]$disk.Size
+      DiskFreeB  = [double]$disk.FreeSpace
+      Transport  = "Native SMB2/IPC$ + RPC Service (Port 445)"
+    } | ConvertTo-Json -Compress
+    exit 0
+  } catch {
+    $null = & net use "\\$targetIp\C$" /delete /y 2>$null
+    $null = & net use "\\$targetIp\ADMIN$" /delete /y 2>$null
+    $null = & net use "\\$targetIp\IPC$" /delete /y 2>$null
+    $errList += "[SMB-SCM-445 $uName]: $($_.Exception.Message)"
+  }
+}
+
+# =========================================================================================
+# STAGE 2: DCOM/RPC Session on Port 135 (New-CimSession -Protocol Dcom)
+# =========================================================================================
 foreach ($c in $credCandidates) {
   try {
     $dcomOpt = New-CimSessionOption -Protocol Dcom
@@ -3042,43 +3373,6 @@ foreach ($c in $credCandidates) {
   }
 }
 
-# 2. Try SMB2 IPC$ Mount (Port 445) + WMI/SCM Service Query
-foreach ($c in $credCandidates) {
-  $uName = $c.UserName
-  try {
-    $ _ = & net use "\\$targetIp\IPC$" $pass /user:$uName 2>&1
-    $cs   = Get-WmiObject -ComputerName $targetIp -Credential $c -Class Win32_ComputerSystem -ErrorAction Stop
-    $os   = Get-WmiObject -ComputerName $targetIp -Credential $c -Class Win32_OperatingSystem -ErrorAction Stop
-    $cpus = @(Get-WmiObject -ComputerName $targetIp -Credential $c -Class Win32_Processor -ErrorAction Stop)
-    $disk = Get-WmiObject -ComputerName $targetIp -Credential $c -Class Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction SilentlyContinue
-    $ _ = & net use "\\$targetIp\IPC$" /delete /y 2>&1
-    $cpuLoadVal = 0
-    if ($cpus.Count -gt 0) {
-      $m = ($cpus | Measure-Object -Property LoadPercentage -Average)
-      if ($null -ne $m.Average) { $cpuLoadVal = [double]$m.Average }
-    }
-    $cores = 0
-    foreach ($cpu in $cpus) { $cores += [int]$cpu.NumberOfLogicalProcessors }
-    if ($cores -lt 1) { $cores = 1 }
-    [PSCustomObject]@{
-      Hostname   = [string]$cs.Name
-      OSCaption  = [string]$os.Caption
-      MemTotalKB = [double]$os.TotalVisibleMemorySize
-      MemFreeKB  = [double]$os.FreePhysicalMemory
-      CPUName    = [string]$cpus[0].Name
-      CPUCores   = [int]$cores
-      CPULoad    = [double]$cpuLoadVal
-      DiskSizeB  = [double]$disk.Size
-      DiskFreeB  = [double]$disk.FreeSpace
-      Transport  = "Native SMB2/IPC$ + RPC Service (Port 445)"
-    } | ConvertTo-Json -Compress
-    exit 0
-  } catch {
-    $ _ = & net use "\\$targetIp\IPC$" /delete /y 2>&1
-    $errList += "[SMB-445 $uName]: $($_.Exception.Message)"
-  }
-}
-
 Write-Error ($errList -join " | ")
 exit 1
 `
@@ -3087,6 +3381,7 @@ exit 1
 		"VECTRANET_TARGET_IP="+targetIP,
 		"VECTRANET_CRED_USER="+username,
 		"VECTRANET_CRED_PASS="+password,
+		"VECTRANET_SERVER_ORIGIN="+serverOrigin,
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -3098,7 +3393,7 @@ exit 1
 		if len(lines) > 2 {
 			errMsg = strings.TrimSpace(lines[0]) + " " + strings.TrimSpace(lines[1])
 		}
-		return RealHardwareSnapshot{}, "", fmt.Errorf("eksekusi Native RPC/SMB (Port 135/445) ke %s ditolak: %s", targetIP, errMsg)
+		return RealHardwareSnapshot{}, "", stepLogs, fmt.Errorf("injeksi SMB Share (C$\\Windows\\Temp) & RPC Service (Port 445/135) ke %s ditolak: %s", targetIP, errMsg)
 	}
 
 	var remoteData struct {
@@ -3118,8 +3413,15 @@ exit 1
 		cleanJSON = cleanJSON[idx:]
 	}
 	if err := json.Unmarshal(cleanJSON, &remoteData); err != nil {
-		return RealHardwareSnapshot{}, "", fmt.Errorf("respons RPC/SMB dari %s tidak valid: %v", targetIP, err)
+		return RealHardwareSnapshot{}, "", stepLogs, fmt.Errorf("respons SMB/SCM Service dari %s tidak valid: %v", targetIP, err)
 	}
+
+	stepLogs = append(stepLogs, fmt.Sprintf(
+		"[SMB-SCM-SUCCESS] Agen dieksekusi secara silent pada %s (%s) melalui %s",
+		firstNonEmpty(strings.TrimSpace(remoteData.Hostname), smbResolvedHost, targetIP),
+		targetIP,
+		firstNonEmpty(remoteData.Transport, "SMB Share (C$\\Windows\\Temp) + RPC Service (Port 445/135)"),
+	))
 
 	snap := RealHardwareSnapshot{
 		Hostname:    firstNonEmpty(strings.TrimSpace(remoteData.Hostname), smbResolvedHost, targetIP),
@@ -3135,7 +3437,7 @@ exit 1
 		DiskUsedGB:  round2(math.Max(0.1, (remoteData.DiskSizeB-remoteData.DiskFreeB)/(1024.0*1024.0*1024.0))),
 		AgentRSSMB:  12.4,
 	}
-	return snap, firstNonEmpty(remoteData.Transport, "Native SMB2/RPC (Port 445/135)"), nil
+	return snap, firstNonEmpty(remoteData.Transport, "Native SMB2/RPC Service (Port 445/135)"), stepLogs, nil
 }
 
 // executeRemoteWinRMProbeAndDeploy connects to targetIP strictly over WinRM standard ports:
@@ -3399,7 +3701,7 @@ func (s *VectraNetServer) handlePushDeploy(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 35*time.Second)
 	defer cancel()
 
 	execLogs := make([]string, 0)
@@ -3501,7 +3803,6 @@ func (s *VectraNetServer) handlePushDeploy(w http.ResponseWriter, r *http.Reques
 	deployedIDs := make([]string, 0)
 	deployedHosts := make([]string, 0)
 	failedCount := 0
-	serverOrigin := fmt.Sprintf("http://%s", r.Host)
 
 	for _, item := range targetList {
 		var dbID, dbHostname, dbIP, dbOS string
@@ -3523,6 +3824,7 @@ func (s *VectraNetServer) handlePushDeploy(w http.ResponseWriter, r *http.Reques
 		targetIP := firstNonEmpty(item.IPAddress, dbIP)
 		targetHost := firstNonEmpty(dbHostname, item.Hostname, targetIP)
 		targetOS := firstNonEmpty(dbOS, item.OS)
+		serverOrigin := resolveServerLANOriginForTarget(targetIP, r.Host)
 
 		execLogs = append(execLogs, fmt.Sprintf(
 			"[DEPLOY-START] Memetakan port standar & memindai layanan aktif pada %s (%s) menggunakan kredensial '%s' (user: %s)...",
@@ -3559,8 +3861,8 @@ func (s *VectraNetServer) handlePushDeploy(w http.ResponseWriter, r *http.Reques
 					targetIP, strings.Join(closedSummaries, ", "),
 				))
 				execLogs = append(execLogs, fmt.Sprintf(
-					"[MANUAL-INSTALL] Skrip Agen PowerShell 1-Baris (jalankan di PC %s tanpa perlu buka port): %s",
-					targetIP, buildManualPowerShellAgentOneLiner(serverOrigin, targetIP),
+					"[MANUAL-INSTALL] Skrip Agen PowerShell 1-Baris (jalankan di PC %s -> kirim ke %s): %s",
+					targetIP, serverOrigin, buildManualPowerShellAgentOneLiner(serverOrigin, targetIP),
 				))
 				execLogs = append(execLogs, fmt.Sprintf(
 					"[REMEDIATION-POWERSHELL] Atau buka firewall WinRM/RPC di PC %s (PowerShell Admin): %s",
@@ -3601,15 +3903,20 @@ func (s *VectraNetServer) handlePushDeploy(w http.ResponseWriter, r *http.Reques
 					}
 
 					// 2. If WinRM (5986/5985) is closed or rejected, and RPC (135) or SMB (445) is open ->
-					//    Strictly use Native Go SMB2/IPC$ (Port 445) & DCE/RPC Service/WMI (Port 135) — NEVER WinRM over 445!
+					//    Automatically fall back to SMB Share (\\target\C$\Windows\Temp) + Remote SCM Service Creation
+					//    (`sc.exe \\target create/start VectraNetAgentSvc`) + WMI/DCOM over Port 445/135!
 					if (deployErr != nil || (!openMap[5986] && !openMap[5985])) && (openMap[135] || openMap[445]) {
 						execLogs = append(execLogs, fmt.Sprintf(
-							"[SMB-RPC-NATIVE] Port WinRM (5986/5985) tidak tersedia pada %s -> Menggunakan jalur Native Go SMB2/IPC$ (Port 445) & DCE/RPC Service (Port 135)...",
-							targetIP,
+							"[SMB-RPC-FALLBACK] Port WinRM (5986/5985) tertutup pada %s -> Mengaktifkan jalur otomatis SMB Share (\\\\%s\\C$\\Windows\\Temp) & Remote SCM Service Creation (Port 445/135)...",
+							targetIP, targetIP,
 						))
-						targetHW, transportUsed, deployErr = executeNativeGoSMBRPCServiceDeploy(
-							ctx, targetIP, cred.Username, decryptedPassword, openMap[135], openMap[445],
+						var smbLogs []string
+						targetHW, transportUsed, smbLogs, deployErr = executeNativeGoSMBRPCServiceDeploy(
+							ctx, targetIP, cred.Username, decryptedPassword, serverOrigin, openMap[135], openMap[445],
 						)
+						if len(smbLogs) > 0 {
+							execLogs = append(execLogs, smbLogs...)
+						}
 					}
 
 					// 3. If Windows ports failed or were closed, and SSH (Port 22) is open, try SSH on Port 22
@@ -3624,8 +3931,8 @@ func (s *VectraNetServer) handlePushDeploy(w http.ResponseWriter, r *http.Reques
 
 				if deployErr != nil {
 					execLogs = append(execLogs, fmt.Sprintf(
-						"[MANUAL-INSTALL] Skrip Agen PowerShell 1-Baris (jalankan di PC %s tanpa perlu buka port): %s",
-						targetIP, buildManualPowerShellAgentOneLiner(serverOrigin, targetIP),
+						"[MANUAL-INSTALL] Skrip Agen PowerShell 1-Baris (jalankan di PC %s -> kirim ke %s): %s",
+						targetIP, serverOrigin, buildManualPowerShellAgentOneLiner(serverOrigin, targetIP),
 					))
 					execLogs = append(execLogs, fmt.Sprintf(
 						"[REMEDIATION-POWERSHELL] Atau buka firewall WinRM/RPC di PC %s (PowerShell Admin): %s",

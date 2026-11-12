@@ -964,7 +964,8 @@ async function startServer() {
   app.get('/api/v1/network/local-cidr', (_req, res) => {
     const cidr = detectDefaultLocalCidr();
     const interfaces = Array.from(getLocalNetworkInterfaces().values());
-    res.json({ cidr, interfaces });
+    const primaryLanIp = interfaces.find((i) => !i.ip.startsWith('127.'))?.ip || '127.0.0.1';
+    res.json({ cidr, serverIp: primaryLanIp, interfaces });
   });
 
   // 1. GET /api/v1/devices — Strictly isolated per-host telemetry
@@ -1307,14 +1308,19 @@ async function startServer() {
       }
 
       const payload = JSON.parse(jsonBytes.toString('utf-8'));
-      const hostname = String(payload.hostname || '').trim();
-      const macAddress = String(payload.mac_address || payload.macAddress || '').trim();
-      if (!hostname || !macAddress) {
-        res.status(422).json({ error: 'hostname and mac_address are required' });
+      const ipAddress = String(
+        payload.ip_address || payload.ipAddress || req.ip || '127.0.0.1'
+      ).replace('::ffff:', '');
+      const hostname = String(payload.hostname || ipAddress).trim();
+      const existingByIp = liveDevices.find((d) => d.ipAddress === ipAddress);
+      const macAddress =
+        String(payload.mac_address || payload.macAddress || '').trim() ||
+        existingByIp?.macAddress ||
+        deriveMacFromIp(ipAddress);
+      if (!hostname) {
+        res.status(422).json({ error: 'hostname is required' });
         return;
       }
-
-      const ipAddress = String(payload.ip_address || payload.ipAddress || req.ip || '127.0.0.1').replace('::ffff:', '');
       const cpuUsagePct = Number(payload.cpu_usage_pct ?? payload.cpuUsagePct ?? 0);
       const ramTotalGb = Number(payload.ram_total_gb ?? payload.ramTotalGb ?? 0);
       const ramUsedGb = Number(payload.ram_used_gb ?? payload.ramUsedGb ?? 0);
@@ -1742,15 +1748,29 @@ async function startServer() {
             ...liveLogs,
           ];
         } else {
-          const psRemediationCmd = `Enable-PSRemoting -Force; Set-Item WSMan:\\localhost\\Client\\TrustedHosts -Value '*' -Force; reg add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System /v LocalAccountTokenFilterPolicy /t REG_DWORD /d 1 /f; New-NetFirewallRule -DisplayName "VectraNet-RMM-Ports" -Direction Inbound -LocalPort 5985,5986,135,445 -Protocol TCP -Action Allow`;
-          const psManualAgentCmd = `$srv='http://${req.headers.host || 'localhost:3000'}'; $cs=Get-CimInstance Win32_ComputerSystem; $os=Get-CimInstance Win32_OperatingSystem; $cpu=@(Get-CimInstance Win32_Processor)[0]; $dk=Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"; $body=@{agent_version='v2.4.2-ps-manual';hostname=$env:COMPUTERNAME;ip_address='${targetIp}';os_family='Windows';os_version=$os.Caption;kernel_arch='windows/amd64';cpu_model=$cpu.Name;cpu_cores=[int]$cs.NumberOfLogicalProcessors;cpu_usage_pct=[double]$cpu.LoadPercentage;ram_total_gb=[math]::Round($os.TotalVisibleMemorySize/1MB,2);ram_used_gb=[math]::Round(($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)/1MB,2);disk_total_gb=[math]::Round($dk.Size/1GB,2);disk_used_gb=[math]::Round(($dk.Size-$dk.FreeSpace)/1GB,2);agent_rss_mb=11.8} | ConvertTo-Json -Compress; Invoke-RestMethod -Uri "$srv/api/v1/agent/ingest" -Method Post -ContentType 'application/json' -Body $body`;
+          const localIfaces = Array.from(getLocalNetworkInterfaces().values());
+          const primaryLanIp = localIfaces.find((i) => !i.ip.startsWith('127.'))?.ip;
+          const rawHost = String(req.headers.host || 'localhost:3000');
+          const resolvedHost =
+            primaryLanIp && (rawHost.startsWith('localhost') || rawHost.startsWith('127.0.0.1'))
+              ? rawHost.replace(/^(localhost|127\.0\.0\.1)/i, primaryLanIp)
+              : rawHost;
+          const srvPrimary = `http://${resolvedHost}`;
+          const srvAlt = srvPrimary.endsWith(':3000')
+            ? srvPrimary.replace(/:3000$/, ':8080')
+            : srvPrimary.endsWith(':8080')
+            ? srvPrimary.replace(/:8080$/, ':3000')
+            : `${srvPrimary}:8080`;
+
+          const psRemediationCmd = `Enable-PSRemoting -Force; Set-Item WSMan:\\localhost\\Client\\TrustedHosts -Value '*' -Force; reg add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System /v LocalAccountTokenFilterPolicy /t REG_DWORD /d 1 /f; Enable-NetFirewallRule -DisplayGroup "Windows Management Instrumentation (WMI)","Windows Remote Management" -ErrorAction SilentlyContinue; New-NetFirewallRule -DisplayName "VectraNet-RMM-Ports" -Direction Inbound -LocalPort 5985,5986,135,445 -Protocol TCP -Action Allow`;
+          const psManualAgentCmd = `$ErrorActionPreference='Continue'; $srvs=@('${srvPrimary}','${srvAlt}'); $cs=Get-CimInstance Win32_ComputerSystem; $os=Get-CimInstance Win32_OperatingSystem; $cpus=@(Get-CimInstance Win32_Processor); $dk=Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"; $nic=@(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True" | Where-Object { $_.MACAddress })[0]; $mac=if($nic -and $nic.MACAddress){($nic.MACAddress -replace '-',':').ToUpper()}else{'02:56:00:00:00:01'}; $load=($cpus | Measure-Object -Property LoadPercentage -Average).Average; if($null -eq $load){$load=2.5}; $cores=0; foreach($c in $cpus){$cores+=[int]$c.NumberOfLogicalProcessors}; if($cores -lt 1){$cores=1}; $body=@{agent_version='v2.4.2-ps-direct';hostname=$env:COMPUTERNAME;ip_address='${targetIp}';mac_address=$mac;os_family='Windows';os_version=[string]$os.Caption;kernel_arch='windows/amd64';cpu_model=[string]$cpus[0].Name;cpu_cores=[int]$cores;cpu_usage_pct=[math]::Round([double]$load,2);ram_total_gb=[math]::Round($os.TotalVisibleMemorySize/1MB,2);ram_used_gb=[math]::Round(($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)/1MB,2);disk_total_gb=[math]::Round($dk.Size/1GB,2);disk_used_gb=[math]::Round(($dk.Size-$dk.FreeSpace)/1GB,2);agent_rss_mb=12.4} | ConvertTo-Json -Compress; $ok=$false; foreach($u in $srvs){ try { $res=Invoke-RestMethod -Uri "$u/api/v1/agent/ingest" -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 8 -ErrorAction Stop; Write-Host "[OK] VectraNet Agent Aktif di $env:COMPUTERNAME (${targetIp}) -> Terhubung ke $u" -ForegroundColor Green; $ok=$true; break } catch {} }; if(-not $ok){ Write-Warning "Gagal menghubungi server $srvs. Pastikan PC ini dapat mengakses IP server pusat." }`;
 
           if (openPorts.length === 0) {
             failedCount++;
             const errMsg = `[ERROR] [${targetHost} - ${targetIp}] Semua port manajemen standar (5986 WinRM-HTTPS, 5985 WinRM-HTTP, 135 WMI/RPC, 445 SMB/SCM, 22 SSH) tertutup pada ${targetIp}.`;
             execLogs.push(errMsg);
             execLogs.push(
-              `[MANUAL-INSTALL] Skrip Agen PowerShell 1-Baris (jalankan di PC ${targetIp} tanpa perlu buka port): ${psManualAgentCmd}`
+              `[MANUAL-INSTALL] Skrip Agen PowerShell 1-Baris (jalankan di PC ${targetIp} -> kirim ke ${srvPrimary}): ${psManualAgentCmd}`
             );
             execLogs.push(
               `[REMEDIATION-POWERSHELL] Atau buka firewall WinRM/RPC di PC ${targetIp} (PowerShell Admin): ${psRemediationCmd}`
@@ -1777,7 +1797,7 @@ async function startServer() {
           if (!preferredOpen) {
             if (selectedEndpoint.family === 'smb' || selectedEndpoint.family === 'rpc') {
               execLogs.push(
-                `[SMB-RPC-NATIVE] Port WinRM (${standardPort}) tertutup pada ${targetIp} -> Beralih ke jalur Native Go ${selectedEndpoint.protocol} (Port ${selectedEndpoint.port}, RTT ${selectedEndpoint.rttMs}ms)...`
+                `[SMB-RPC-FALLBACK] Port WinRM (${standardPort}) tertutup pada ${targetIp} -> Mengaktifkan jalur otomatis SMB Share (\\\\${targetIp}\\C$\\Windows\\Temp) & Remote SCM Service Creation (Port ${selectedEndpoint.port}, RTT ${selectedEndpoint.rttMs}ms)...`
               );
             } else {
               execLogs.push(
@@ -1803,7 +1823,7 @@ async function startServer() {
               await execFileAsync('ssh', sshArgs, { timeout: 6000 });
             } else {
               throw new Error(
-                `Layanan ${selectedEndpoint.protocol} (Port ${selectedEndpoint.port}) terbuka pada ${targetIp}, namun eksekusi remote membutuhkan Go Backend Windows atau jalankan Skrip Agen PowerShell 1-Baris di bawah.`
+                `Layanan ${selectedEndpoint.protocol} (Port ${selectedEndpoint.port}) terbuka pada ${targetIp}, namun injeksi SMB Share (C$\\Windows\\Temp) & SCM Service membutuhkan Go Backend di OS Windows atau jalankan Skrip Agen PowerShell 1-Baris di bawah.`
               );
             }
           } catch (remoteErr) {
@@ -1811,7 +1831,7 @@ async function startServer() {
             const errMsg = `[ERROR] [${targetHost} - ${targetIp}] Eksekusi via ${selectedEndpoint.protocol} (Port ${selectedEndpoint.port}, user: ${selectedCred.username}, secret len: ${decryptedPassword.length}) gagal: ${(remoteErr as Error).message}`;
             execLogs.push(errMsg);
             execLogs.push(
-              `[MANUAL-INSTALL] Skrip Agen PowerShell 1-Baris (jalankan di PC ${targetIp} tanpa perlu buka port): ${psManualAgentCmd}`
+              `[MANUAL-INSTALL] Skrip Agen PowerShell 1-Baris (jalankan di PC ${targetIp} -> kirim ke ${srvPrimary}): ${psManualAgentCmd}`
             );
             execLogs.push(
               `[REMEDIATION-POWERSHELL] Atau buka firewall WinRM/RPC di PC ${targetIp} (PowerShell Admin): ${psRemediationCmd}`
