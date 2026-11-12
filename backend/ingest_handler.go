@@ -608,11 +608,11 @@ func (s *VectraNetServer) handleAgentIngest(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *VectraNetServer) persistTelemetryTransaction(ctx context.Context, p AgentIngestRequest, elapsed time.Duration) (string, error) {
-	tx, err := s.dbPool.BeginTx(ctx, pgx.TxOptions{})
+	dbTx, err := s.dbPool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return "", err
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	defer func() { _ = dbTx.Rollback(ctx) }()
 
 	deviceStatus := "online"
 	ramPct := 0.0
@@ -665,7 +665,7 @@ func (s *VectraNetServer) persistTelemetryTransaction(ctx context.Context, p Age
 			updated_at        = NOW()
 		RETURNING id::text;
 	`
-	err = tx.QueryRow(
+	err = dbTx.QueryRow(
 		ctx,
 		upsertDeviceSQL,
 		p.Hostname,
@@ -725,19 +725,21 @@ func (s *VectraNetServer) persistTelemetryTransaction(ctx context.Context, p Age
 		if vlan == 0 {
 			vlan = 1
 		}
-		rx := iface.RxMbps
-		if rx == 0 {
-			rx = iface.AltRx
+		rxMbps := iface.RxMbps
+		if rxMbps == 0 {
+			rxMbps = iface.AltRx
 		}
-		tx := iface.TxMbps
-		if tx == 0 {
-			tx = iface.AltTx
+		txMbps := iface.TxMbps
+		if txMbps == 0 {
+			txMbps = iface.AltTx
 		}
 		primary := iface.IsPrimary || iface.AltPrimary
 
-		totalRxMbps += rx
-		totalTxMbps += tx
-		_, _ = tx.Exec(ctx, upsertIfaceSQL, deviceID, ifName, ifIP, ifMAC, speed, vlan, rx, tx, primary)
+		totalRxMbps += rxMbps
+		totalTxMbps += txMbps
+		if _, err := dbTx.Exec(ctx, upsertIfaceSQL, deviceID, ifName, ifIP, ifMAC, speed, vlan, rxMbps, txMbps, primary); err != nil {
+			return "", fmt.Errorf("upsert network_interface %s failed: %w", ifName, err)
+		}
 	}
 
 	if len(p.Software) > 0 {
@@ -757,7 +759,9 @@ func (s *VectraNetServer) persistTelemetryTransaction(ctx context.Context, p Age
 			if swName == "" || sw.Version == "" {
 				continue
 			}
-			_, _ = tx.Exec(ctx, upsertSoftwareSQL, deviceID, swName, sw.Version, sw.Publisher, swDate)
+			if _, err := dbTx.Exec(ctx, upsertSoftwareSQL, deviceID, swName, sw.Version, sw.Publisher, swDate); err != nil {
+				return "", fmt.Errorf("upsert software %s failed: %w", swName, err)
+			}
 		}
 	}
 
@@ -769,7 +773,7 @@ func (s *VectraNetServer) persistTelemetryTransaction(ctx context.Context, p Age
 			$1, $2, $3, $4, $5, $6, $7, $8, $9
 		);
 	`
-	if _, err := tx.Exec(
+	if _, err := dbTx.Exec(
 		ctx,
 		insertTelemetrySQL,
 		p.RecordedAt,
@@ -786,12 +790,12 @@ func (s *VectraNetServer) persistTelemetryTransaction(ctx context.Context, p Age
 	}
 
 	latencyMs := math.Max(0.4, math.Round(float64(elapsed.Microseconds())/100.0)/10.0)
-	_, _ = tx.Exec(ctx, `
+	_, _ = dbTx.Exec(ctx, `
 		INSERT INTO system_logs (level, module, device_hostname, message, latency_ms)
 		VALUES ('INFO', 'INGEST-TLS', $1, $2, $3)
 	`, p.Hostname, fmt.Sprintf("POST /api/v1/agent/ingest payload stored (CPU %.1f%%, Agent RSS %.2f MB)", p.CPUUsagePct, p.AgentRSSMB), latencyMs)
 
-	if err := tx.Commit(ctx); err != nil {
+	if err := dbTx.Commit(ctx); err != nil {
 		return "", err
 	}
 	return deviceID, nil
