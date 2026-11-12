@@ -1,13 +1,19 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Rocket,
   X,
   Lock,
   CheckCircle2,
+  AlertTriangle,
   Terminal,
   ShieldCheck,
+  RefreshCw,
 } from 'lucide-react';
-import { CredentialVaultEntry, DeviceAsset } from '../types/network';
+import {
+  CredentialVaultEntry,
+  DeployExecutionResult,
+  DeviceAsset,
+} from '../types/network';
 
 interface PushDeployModalProps {
   isOpen: boolean;
@@ -15,7 +21,11 @@ interface PushDeployModalProps {
   credentials: CredentialVaultEntry[];
   lang: 'id' | 'en';
   onClose: () => void;
-  onConfirmDeploy: (targetIds: string[], credentialId: string) => void;
+  onConfirmDeploy: (
+    targetIds: string[],
+    credentialId: string,
+    targetDevices: DeviceAsset[]
+  ) => Promise<DeployExecutionResult>;
 }
 
 export const PushDeployModal: React.FC<PushDeployModalProps> = ({
@@ -31,75 +41,108 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
   );
   const [isDeploying, setIsDeploying] = useState(false);
   const [completed, setCompleted] = useState(false);
+  const [deployFailed, setDeployFailed] = useState(false);
+  const [deployErrorText, setDeployErrorText] = useState<string | null>(null);
   const [stepLogs, setStepLogs] = useState<string[]>([]);
+
+  // Reset modal execution state ONLY when modal opens or target device list changes
+  const targetKey = targetDevices.map((d) => `${d.id}:${d.ipAddress}`).join(',');
+  useEffect(() => {
+    if (isOpen) {
+      setIsDeploying(false);
+      setCompleted(false);
+      setDeployFailed(false);
+      setDeployErrorText(null);
+      setStepLogs([]);
+    }
+  }, [isOpen, targetKey]);
+
+  // Keep selectedCredentialId synced when credentials list updates without resetting logs
+  useEffect(() => {
+    if (
+      credentials.length > 0 &&
+      (!selectedCredentialId || !credentials.some((c) => c.id === selectedCredentialId))
+    ) {
+      setSelectedCredentialId(credentials[0].id);
+    }
+  }, [credentials, selectedCredentialId]);
 
   if (!isOpen || targetDevices.length === 0) return null;
 
   const selectedCred =
-    credentials.find((c) => c.id === selectedCredentialId) ||
-    credentials[0] || {
-      id: 'default-vault-key',
-      label: 'Default Ephemeral RMM Key',
-      protocol: 'SSH-Ed25519',
-      username: 'root',
-      port: 22,
-      scopeSubnet: '0.0.0.0/0',
-      cipherPreview: 'aes256gcm$ephemeral',
-      ivHex: '000000000000',
-      authTagHex: '0000000000000000',
-      keyFingerprint: 'SHA256:EPHEMERAL:VAULT',
-      lastRotated: 'Runtime',
-      createdBy: 'system',
-      verified: true,
-    };
+    credentials.find((c) => c.id === selectedCredentialId) || credentials[0] || null;
 
-  const handleRunPush = () => {
+  const handleRunPush = async () => {
+    if (!selectedCred) {
+      setDeployFailed(true);
+      setDeployErrorText(
+        lang === 'id'
+          ? 'Brankas Kredensial (Credential Vault) masih kosong. Silakan tambahkan profil kredensial WinRM/SSH terlebih dahulu di tab Credential Vault.'
+          : 'Credential Vault is empty. Please add a WinRM/SSH credential profile in the Credential Vault tab first.'
+      );
+      setStepLogs([
+        `[00.0s] [ERROR] Tidak ada profil kredensial di Credential Vault. Membatalkan Push Deployment ke ${targetDevices
+          .map((d) => `${d.hostname} (${d.ipAddress})`)
+          .join(', ')}.`,
+      ]);
+      return;
+    }
+
     setIsDeploying(true);
     setCompleted(false);
+    setDeployFailed(false);
+    setDeployErrorText(null);
 
-    const logs: string[] = [
-      `[00.1s] Decrypting Vault credential "${selectedCred.label}" (${selectedCred.protocol}) via Master KEK (AES-256-GCM)...`,
-    ];
+    const targetListStr = targetDevices
+      .map((d) => `${d.hostname} (${d.ipAddress})`)
+      .join(', ');
 
-    targetDevices.forEach((dev) => {
-      const osLower = dev.os.toLowerCase();
-      if (osLower.includes('windows')) {
-        logs.push(
-          `[00.4s] [${dev.hostname} - ${dev.ipAddress}] Connecting via WinRM-HTTPS (Port 5986) -> executing /agents/windows/install.ps1`
-        );
-        logs.push(
-          `[00.9s] [${dev.hostname}] Downloaded /downloads/windows/vectranet-agent.exe -> C:\\Program Files\\VectraNet\\vectranet-agent.exe`
-        );
-        logs.push(
-          `[01.3s] [${dev.hostname}] Registered Windows Service 'VectraNetAgent' (MemoryLimit=15MB) & started daemon`
-        );
-      } else if (osLower.includes('macos')) {
-        logs.push(
-          `[00.4s] [${dev.hostname} - ${dev.ipAddress}] Connecting via SSH-Ed25519 (Port 22) -> executing /agents/macos/install.sh`
-        );
-        logs.push(
-          `[00.8s] [${dev.hostname}] Installed /Library/Application Support/VectraNet/vectranet-agent & loaded LaunchDaemon com.vectranet.agent.plist`
-        );
+    setStepLogs([
+      `[00.1s] Mengirim instruksi Push Deployment ke backend (/api/v1/deploy)...`,
+      `[00.1s] Target Dinamis: ${targetListStr}`,
+      `[00.1s] Kredensial Terpilih: "${selectedCred.label}" [User: ${selectedCred.username} | Proto: ${selectedCred.protocol} | Port: ${selectedCred.port}]`,
+    ]);
+
+    try {
+      const result = await onConfirmDeploy(
+        targetDevices.map((d) => d.id),
+        selectedCred.id,
+        targetDevices
+      );
+
+      if (Array.isArray(result.logs) && result.logs.length > 0) {
+        setStepLogs(result.logs);
+      }
+
+      if (result.status === 'deployed' && result.deployedCount > 0) {
+        setCompleted(true);
+        setDeployFailed(result.failedCount ? result.failedCount > 0 : false);
+        if (result.failedCount && result.failedCount > 0) {
+          setDeployErrorText(
+            lang === 'id'
+              ? `Berhasil pada ${result.deployedCount} host, gagal pada ${result.failedCount} host.`
+              : `Succeeded on ${result.deployedCount} host(s), failed on ${result.failedCount} host(s).`
+          );
+        }
       } else {
-        logs.push(
-          `[00.4s] [${dev.hostname} - ${dev.ipAddress}] Connecting via SSH-Ed25519 (Port 22) -> executing /agents/linux/install.sh`
-        );
-        logs.push(
-          `[00.8s] [${dev.hostname}] Installed /usr/local/bin/vectranet-agent & enabled systemd unit (MemoryMax=20M, CPUQuota=2%)`
+        setCompleted(false);
+        setDeployFailed(true);
+        setDeployErrorText(
+          result.error ||
+            (lang === 'id'
+              ? 'Koneksi atau otentikasi ke target gagal. Status perangkat tetap Agentless.'
+              : 'Target connection or authentication failed. Device remains Agentless.')
         );
       }
-      logs.push(
-        `[01.6s] [${dev.hostname}] Verified first TLS 1.3 Gzip telemetry frame at /api/v1/agent/ingest`
-      );
-    });
-
-    setStepLogs(logs);
-    onConfirmDeploy(
-      targetDevices.map((d) => d.id),
-      selectedCred.id
-    );
-    setIsDeploying(false);
-    setCompleted(true);
+    } catch (err) {
+      setCompleted(false);
+      setDeployFailed(true);
+      const errMsg = (err as Error).message || 'Network error';
+      setDeployErrorText(errMsg);
+      setStepLogs((prev) => [...prev, `[ERROR] Eksekusi gagal: ${errMsg}`]);
+    } finally {
+      setIsDeploying(false);
+    }
   };
 
   return (
@@ -121,8 +164,8 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
               </h2>
               <p className="text-xs text-slate-400">
                 {lang === 'id'
-                  ? 'Instalasi silent biner agen Go ultra-ringan tanpa perlu intervensi manual di endpoint.'
-                  : 'Silent installation of the ultra-light Go agent binary across target endpoints.'}
+                  ? 'Dekripsi kredensial AES-256-GCM & eksekusi koneksi nyata ke IP target.'
+                  : 'Real AES-256-GCM credential decryption & live connection to target IP.'}
               </p>
             </div>
           </div>
@@ -137,12 +180,12 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
           </button>
         </div>
 
-        {/* Target Devices Summary */}
+        {/* Target Devices Summary (Dynamic from UI Row Selection) */}
         <div>
           <div className="text-xs font-medium text-slate-300 mb-2">
             {lang === 'id'
-              ? `Target Perangkat (${targetDevices.length} Host):`
-              : `Target Endpoints (${targetDevices.length} Hosts):`}
+              ? `Target Perangkat Dinamis (${targetDevices.length} Host):`
+              : `Dynamic Target Endpoints (${targetDevices.length} Hosts):`}
           </div>
           <div className="max-h-32 overflow-y-auto space-y-1.5 p-2.5 rounded-lg bg-[#0B0F17] border border-[#1E293B]">
             {targetDevices.map((dev) => (
@@ -150,11 +193,16 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
                 key={dev.id}
                 className="flex items-center justify-between text-xs font-mono text-slate-200"
               >
-                <span>
+                <span className="text-emerald-300 font-semibold">
                   {dev.hostname} ({dev.ipAddress})
                 </span>
                 <span className="text-slate-400">
-                  {dev.os} · {dev.os.includes('Windows') ? 'WinRM-HTTPS' : 'SSH-Systemd'}
+                  {dev.os} ·{' '}
+                  {selectedCred
+                    ? `${selectedCred.protocol} (Port ${selectedCred.port})`
+                    : dev.os.toLowerCase().includes('windows')
+                    ? 'WinRM (5985/5986)'
+                    : 'SSH (22)'}
                 </span>
               </div>
             ))}
@@ -169,34 +217,96 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
           >
             <Lock className="w-3.5 h-3.5 text-emerald-400" />
             {lang === 'id'
-              ? 'Pilih Kredensial Otentikasi dari Brankas AES-256'
-              : 'Select Authentication Credential from AES-256 Vault'}
+              ? 'Pilih Kredensial Otentikasi dari Brankas AES-256-GCM'
+              : 'Select Authentication Credential from AES-256-GCM Vault'}
           </label>
-          <select
-            id="deploy-cred-select"
-            value={selectedCredentialId}
-            onChange={(e) => setSelectedCredentialId(e.target.value)}
-            className="w-full px-3.5 py-2 text-xs font-mono bg-[#0B0F17] border border-[#1E293B] rounded-lg text-slate-100"
-          >
-            {credentials.map((cred) => (
-              <option key={cred.id} value={cred.id}>
-                {cred.label} — [{cred.protocol} | {cred.username} | {cred.keyFingerprint}]
-              </option>
-            ))}
-          </select>
+          {credentials.length === 0 ? (
+            <div className="p-3 rounded-lg bg-rose-500/10 border border-rose-500/30 text-xs text-rose-300">
+              {lang === 'id'
+                ? 'Brankas Kredensial masih kosong. Tambahkan kredensial perangkat target (misal profil edp07) di menu Credential Vault terlebih dahulu.'
+                : 'Credential Vault is empty. Please add a target credential profile in Credential Vault first.'}
+            </div>
+          ) : (
+            <select
+              id="deploy-cred-select"
+              value={selectedCredentialId}
+              disabled={isDeploying}
+              onChange={(e) => {
+                setSelectedCredentialId(e.target.value);
+                setCompleted(false);
+                setDeployFailed(false);
+                setDeployErrorText(null);
+              }}
+              className="w-full px-3.5 py-2 text-xs font-mono bg-[#0B0F17] border border-[#1E293B] rounded-lg text-slate-100 focus:outline-none focus:border-emerald-500"
+            >
+              {credentials.map((cred) => (
+                <option key={cred.id} value={cred.id}>
+                  {cred.label} — [{cred.protocol} | User: {cred.username} | Port: {cred.port} |{' '}
+                  {cred.keyFingerprint}]
+                </option>
+              ))}
+            </select>
+          )}
         </div>
 
         {/* Execution Output Log */}
         {stepLogs.length > 0 && (
           <div className="space-y-2">
-            <div className="flex items-center gap-1.5 text-xs font-medium text-emerald-400">
-              <Terminal className="w-3.5 h-3.5" />
-              <span>Log Eksekusi Remote Deployment</span>
+            <div className="flex items-center justify-between text-xs font-medium">
+              <span className="flex items-center gap-1.5 text-emerald-400">
+                <Terminal className="w-3.5 h-3.5" />
+                <span>
+                  {lang === 'id'
+                    ? 'Log Eksekusi Remote Deployment Nyata'
+                    : 'Live Remote Deployment Execution Log'}
+                </span>
+              </span>
+              {selectedCred && (
+                <span className="font-mono text-[11px] text-slate-400">
+                  Target: {targetDevices.map((d) => d.ipAddress).join(', ')} · Profile:{' '}
+                  {selectedCred.label}
+                </span>
+              )}
             </div>
-            <div className="p-3.5 rounded-lg bg-[#0B0F17] border border-[#1E293B] font-mono text-[11px] text-slate-300 space-y-1 max-h-44 overflow-y-auto">
-              {stepLogs.map((line, idx) => (
-                <div key={idx}>{line}</div>
-              ))}
+            <div className="p-3.5 rounded-lg bg-[#0B0F17] border border-[#1E293B] font-mono text-[11px] space-y-1.5 max-h-52 overflow-y-auto">
+              {stepLogs.map((line, idx) => {
+                const isErr = line.includes('[ERROR]');
+                const isOk = line.includes('[OK]');
+                return (
+                  <div
+                    key={idx}
+                    className={
+                      isErr
+                        ? 'text-rose-400 font-medium'
+                        : isOk
+                        ? 'text-emerald-400'
+                        : 'text-slate-300'
+                    }
+                  >
+                    {line}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Error Banner when connection/authentication fails */}
+        {deployFailed && deployErrorText && (
+          <div
+            role="alert"
+            className="p-3 rounded-lg bg-rose-500/10 border border-rose-500/30 text-xs text-rose-300 flex items-start gap-2"
+          >
+            <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+            <div>
+              <div className="font-semibold text-rose-300">
+                {lang === 'id'
+                  ? 'Push Deployment Gagal — Status Perangkat Tetap Agentless'
+                  : 'Push Deployment Failed — Device Remains Agentless'}
+              </div>
+              <div className="text-[11px] text-rose-200/90 mt-0.5 font-mono">
+                {deployErrorText}
+              </div>
             </div>
           </div>
         )}
@@ -204,7 +314,7 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
         <div className="flex items-center justify-between pt-2 border-t border-[#1E293B]">
           <div className="flex items-center gap-2 text-xs text-slate-400">
             <ShieldCheck className="w-4 h-4 text-emerald-400" />
-            <span>Binary SHA-256 Verified · MemoryMax=18MB</span>
+            <span>AES-256-GCM Unseal · Real TCP/WinRM/SSH Probe</span>
           </div>
 
           <div className="flex items-center gap-2.5">
@@ -213,23 +323,48 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
               onClick={onClose}
               className="px-4 py-2 text-xs font-medium text-slate-300 hover:text-white bg-[#0B0F17] border border-[#1E293B] rounded-lg cursor-pointer"
             >
-              {completed ? (lang === 'id' ? 'Selesai & Tutup' : 'Done & Close') : lang === 'id' ? 'Batal' : 'Cancel'}
+              {completed || deployFailed
+                ? lang === 'id'
+                  ? 'Tutup'
+                  : 'Close'
+                : lang === 'id'
+                ? 'Batal'
+                : 'Cancel'}
             </button>
 
             {!completed ? (
               <button
                 type="button"
-                disabled={isDeploying}
-                onClick={handleRunPush}
-                className="px-4 py-2 text-xs font-semibold bg-emerald-500 hover:bg-emerald-400 text-slate-950 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
+                disabled={isDeploying || credentials.length === 0}
+                onClick={() => void handleRunPush()}
+                className="px-4 py-2 text-xs font-semibold bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer"
               >
-                <Rocket className="w-3.5 h-3.5" />
-                {lang === 'id' ? 'Push Agent Sekarang' : 'Push Agent Now'}
+                {isDeploying ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    <span>
+                      {lang === 'id' ? 'Menghubungi Target...' : 'Connecting to Target...'}
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <Rocket className="w-3.5 h-3.5" />
+                    <span>
+                      {deployFailed
+                        ? lang === 'id'
+                          ? 'Coba Push Ulang'
+                          : 'Retry Push Agent'
+                        : lang === 'id'
+                        ? 'Push Agent Sekarang'
+                        : 'Push Agent Now'}
+                    </span>
+                  </>
+                )}
               </button>
             ) : (
               <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-400">
                 <CheckCircle2 className="w-4 h-4" />
-                {lang === 'id' ? 'Agen Aktif' : 'Agent Active'}
+                {lang === 'id' ? 'Agen Aktif (Terverifikasi)' : 'Agent Active (Verified)'}
               </span>
             )}
           </div>

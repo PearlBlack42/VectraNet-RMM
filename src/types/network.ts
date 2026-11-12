@@ -93,6 +93,23 @@ export interface CredentialVaultEntry {
   lastRotated: string;
   createdBy: string;
   verified: boolean;
+  rawSecret?: string;
+}
+
+export interface DeployTargetDescriptor {
+  id: string;
+  ipAddress: string;
+  hostname: string;
+  os: string;
+}
+
+export interface DeployExecutionResult {
+  status: 'deployed' | 'failed';
+  deployedCount: number;
+  failedCount?: number;
+  deployedIds?: string[];
+  logs?: string[];
+  error?: string;
 }
 
 export interface DeploymentJob {
@@ -105,6 +122,47 @@ export interface DeploymentJob {
   startedAt: string;
   completedAt?: string;
   logs: string[];
+}
+
+export interface DeviceMetricPoint {
+  timestamp: string;
+  timeLabel: string;
+  cpuUsagePct: number;
+  ramUsedGb: number;
+  ramTotalGb: number;
+  ramUsagePct: number;
+  diskUsedGb: number;
+  netRxMbps: number;
+  netTxMbps: number;
+  heartbeatMode: 'idle-eco' | 'standard' | 'burst-event' | string;
+}
+
+export interface DeviceMetricsHistoryResponse {
+  deviceId: string;
+  hostname: string;
+  ipAddress: string;
+  agentState: AgentState;
+  cpuModel: string;
+  cpuCores: number;
+  ramTotalGb: number;
+  windowMinutes: number;
+  points: DeviceMetricPoint[];
+}
+
+export interface IcmpPingStatusEntry {
+  deviceId: string;
+  hostname: string;
+  ipAddress: string;
+  alive: boolean;
+  latencyMs: number;
+  lastPingedAt: string;
+  method: string;
+}
+
+export interface IcmpPingBatchResponse {
+  timestamp: string;
+  intervalSec: number;
+  results: Record<string, IcmpPingStatusEntry>;
 }
 
 export interface ScanProgressState {

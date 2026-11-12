@@ -8,8 +8,14 @@ import {
   filterDevices,
   applyAgentDeployment,
   computeFleetSummary,
+  computeHeartbeatStats,
+  formatIcmpPingStatus,
+  matchesOsFilter,
+  ipToComparableNumber,
+  sortDevices,
+  paginateDevices,
 } from './networkEngine';
-import { DeviceAsset } from '../types/network';
+import { DeviceAsset, DeviceMetricPoint } from '../types/network';
 
 test('parseCidrRange validates standard IPv4 subnets and calculates host capacity', () => {
   const res24 = parseCidrRange('10.24.10.0/24');
@@ -144,3 +150,186 @@ test('filterDevices and applyAgentDeployment transition agentless endpoints to a
   assert.equal(emptySummary.activeAgents, 0);
   assert.equal(emptySummary.avgAgentRamMb, 0);
 });
+
+test('computeHeartbeatStats calculates current, average, and peak CPU/RAM usage over 1-hour series', () => {
+  const emptyStats = computeHeartbeatStats([], 16);
+  assert.equal(emptyStats.sampleCount, 0);
+  assert.equal(emptyStats.currentCpuPct, 0);
+  assert.equal(emptyStats.ramTotalGb, 16);
+
+  const points: DeviceMetricPoint[] = [
+    {
+      timestamp: '2026-11-11T20:30:00Z',
+      timeLabel: '20:30',
+      cpuUsagePct: 20,
+      ramUsedGb: 4,
+      ramTotalGb: 16,
+      ramUsagePct: 25,
+      diskUsedGb: 100,
+      netRxMbps: 1.2,
+      netTxMbps: 0.8,
+      heartbeatMode: 'idle-eco',
+    },
+    {
+      timestamp: '2026-11-11T21:00:00Z',
+      timeLabel: '21:00',
+      cpuUsagePct: 40,
+      ramUsedGb: 8,
+      ramTotalGb: 16,
+      ramUsagePct: 50,
+      diskUsedGb: 100,
+      netRxMbps: 3.4,
+      netTxMbps: 1.9,
+      heartbeatMode: 'standard',
+    },
+    {
+      timestamp: '2026-11-11T21:25:00Z',
+      timeLabel: '21:25',
+      cpuUsagePct: 60,
+      ramUsedGb: 12,
+      ramTotalGb: 16,
+      ramUsagePct: 75,
+      diskUsedGb: 100,
+      netRxMbps: 6.1,
+      netTxMbps: 2.5,
+      heartbeatMode: 'burst-event',
+    },
+  ];
+
+  const stats = computeHeartbeatStats(points, 16);
+  assert.equal(stats.sampleCount, 3);
+  assert.equal(stats.currentCpuPct, 60);
+  assert.equal(stats.avgCpuPct, 40);
+  assert.equal(stats.peakCpuPct, 60);
+  assert.equal(stats.currentRamPct, 75);
+  assert.equal(stats.avgRamPct, 50);
+  assert.equal(stats.peakRamPct, 75);
+  assert.equal(stats.currentRamUsedGb, 12);
+});
+
+test('formatIcmpPingStatus formats reachable and unreachable agentless ICMP ping states', () => {
+  const reachable = formatIcmpPingStatus(
+    {
+      deviceId: 'dev-1',
+      hostname: 'HOST-17',
+      ipAddress: '172.27.170.17',
+      alive: true,
+      latencyMs: 1.84,
+      lastPingedAt: '21:27:10',
+      method: 'ICMP Echo',
+    },
+    2.5,
+    'online'
+  );
+  assert.equal(reachable.alive, true);
+  assert.equal(reachable.latencyMs, 1.8);
+  assert.ok(reachable.labelId.includes('1.8ms'));
+
+  const unreachable = formatIcmpPingStatus(
+    {
+      deviceId: 'dev-2',
+      hostname: 'HOST-99',
+      ipAddress: '172.27.170.99',
+      alive: false,
+      latencyMs: 0,
+      lastPingedAt: '21:27:10',
+      method: 'ICMP Timeout',
+    },
+    0,
+    'offline'
+  );
+  assert.equal(unreachable.alive, false);
+  assert.equal(unreachable.latencyMs, 0);
+  assert.ok(unreachable.labelEn.includes('Unreachable'));
+});
+
+test('matchesOsFilter, sortDevices, and paginateDevices handle OS filtering, numerical IP sorting, and pagination', () => {
+  assert.equal(matchesOsFilter('Windows 11', 'windows'), true);
+  assert.equal(matchesOsFilter('Ubuntu Linux', 'linux'), true);
+  assert.equal(matchesOsFilter('macOS Sequoia', 'macos'), true);
+  assert.equal(matchesOsFilter('Windows 11', 'linux'), false);
+
+  assert.ok(ipToComparableNumber('172.27.170.2') < ipToComparableNumber('172.27.170.10'));
+  assert.ok(ipToComparableNumber('172.27.170.10') < ipToComparableNumber('172.27.170.100'));
+
+  const mockList: DeviceAsset[] = [
+    {
+      id: 'd-10',
+      hostname: 'NODE-10',
+      ipAddress: '172.27.170.10',
+      macAddress: '00:50:56:00:00:10',
+      os: 'Ubuntu Linux',
+      osVersion: '24.04',
+      kernelArch: 'x86_64',
+      role: 'server',
+      status: 'offline',
+      agentState: 'agentless',
+      cpuModel: '',
+      cpuCores: 0,
+      cpuUsagePct: 0,
+      ramTotalGb: 0,
+      ramUsedGb: 0,
+      diskTotalGb: 0,
+      diskUsedGb: 0,
+      lastSeen: '1m',
+      subnet: '172.27.170.0/24',
+      location: 'Rack1',
+      latencyMs: 0,
+      interfaces: [],
+      software: [],
+    },
+    {
+      id: 'd-2',
+      hostname: 'NODE-2',
+      ipAddress: '172.27.170.2',
+      macAddress: '00:50:56:00:00:02',
+      os: 'Windows 11',
+      osVersion: '23H2',
+      kernelArch: 'amd64',
+      role: 'workstation',
+      status: 'online',
+      agentState: 'active',
+      cpuModel: 'i5',
+      cpuCores: 6,
+      cpuUsagePct: 20,
+      ramTotalGb: 16,
+      ramUsedGb: 8,
+      diskTotalGb: 512,
+      diskUsedGb: 100,
+      lastSeen: 'now',
+      subnet: '172.27.170.0/24',
+      location: 'Rack1',
+      latencyMs: 1.1,
+      interfaces: [],
+      software: [],
+    },
+  ];
+
+  const byIpAsc = sortDevices(mockList, 'ip', 'asc');
+  assert.equal(byIpAsc[0].ipAddress, '172.27.170.2');
+  assert.equal(byIpAsc[1].ipAddress, '172.27.170.10');
+
+  const byHostDesc = sortDevices(mockList, 'hostname', 'desc');
+  assert.equal(byHostDesc[0].hostname, 'NODE-10');
+  assert.equal(byHostDesc[1].hostname, 'NODE-2');
+
+  const byStatusAsc = sortDevices(mockList, 'status', 'asc');
+  assert.equal(byStatusAsc[0].status, 'online');
+  assert.equal(byStatusAsc[1].status, 'offline');
+
+  // Test pagination with 60 items at pageSize 25
+  const sixtyItems = Array.from({ length: 60 }, (_, i) => i + 1);
+  const page1 = paginateDevices(sixtyItems, 1, 25);
+  assert.equal(page1.totalPages, 3);
+  assert.equal(page1.startIndex, 1);
+  assert.equal(page1.endIndex, 25);
+  assert.equal(page1.pageItems.length, 25);
+  assert.deepEqual(page1.pageNumbers, [1, 2, 3]);
+
+  const page3 = paginateDevices(sixtyItems, 3, 25);
+  assert.equal(page3.startIndex, 51);
+  assert.equal(page3.endIndex, 60);
+  assert.equal(page3.pageItems.length, 10);
+});
+
+

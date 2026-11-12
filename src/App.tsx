@@ -18,14 +18,23 @@ import {
   RefreshCw,
   PlusCircle,
   Trash2,
+  Wifi,
+  WifiOff,
+  XCircle,
+  ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
 } from 'lucide-react';
 import {
   AdminUserEntry,
   AgentState,
   CredentialVaultEntry,
+  DeployExecutionResult,
   DeviceAsset,
   DeviceStatus,
   EngineConfigState,
+  IcmpPingBatchResponse,
+  IcmpPingStatusEntry,
   NotificationItem,
   ScanProgressState,
   SystemLogEntry,
@@ -36,10 +45,16 @@ import {
   INITIAL_SYSTEM_METRICS,
 } from './data/seedNetworkData';
 import {
+  INVENTORY_PAGE_SIZE_OPTIONS,
+  InventorySortDirection,
+  InventorySortField,
   applyAgentDeployment,
   computeFleetSummary,
   filterDevices,
+  formatIcmpPingStatus,
+  paginateDevices,
   parseCidrRange,
+  sortDevices,
 } from './utils/networkEngine';
 import { TopologyView } from './components/TopologyView';
 import { CredentialVaultView } from './components/CredentialVaultView';
@@ -77,10 +92,20 @@ export default function App() {
   const [isPolling, setIsPolling] = useState<boolean>(false);
   const [apiStatus, setApiStatus] = useState<'connected' | 'syncing' | 'offline'>('syncing');
 
-  // Inventory filters & selection
+  // Real-time 10-second ICMP Ping status for Agentless devices
+  const [icmpPingMap, setIcmpPingMap] = useState<Record<string, IcmpPingStatusEntry>>({});
+  const [lastIcmpSweepAt, setLastIcmpSweepAt] = useState<string>('--:--:--');
+  const [isIcmpSweeping, setIsIcmpSweeping] = useState<boolean>(false);
+
+  // Inventory filters, sorting, pagination & selection
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | DeviceStatus>('all');
   const [agentFilter, setAgentFilter] = useState<'all' | AgentState>('all');
+  const [osFilter, setOsFilter] = useState<string>('all');
+  const [sortField, setSortField] = useState<InventorySortField>('ip');
+  const [sortDirection, setSortDirection] = useState<InventorySortDirection>('asc');
+  const [pageSize, setPageSize] = useState<number>(25);
+  const [currentPage, setCurrentPage] = useState<number>(1);
   const [selectedDeviceIds, setSelectedDeviceIds] = useState<string[]>([]);
 
   // Subnet CIDR Scanner & Real-Time Progress state
@@ -151,6 +176,31 @@ export default function App() {
       });
   }, []);
 
+  // Real-time 10-second ICMP Ping Sweeper for Agentless Devices
+  const fetchAgentlessIcmpPing = useCallback(async () => {
+    setIsIcmpSweeping(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/devices/ping`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      if (res.ok) {
+        const data = (await res.json()) as IcmpPingBatchResponse;
+        if (data && data.results) {
+          setIcmpPingMap(data.results);
+          if (data.timestamp) {
+            setLastIcmpSweepAt(data.timestamp);
+          }
+        }
+      }
+    } catch {
+      // Ignore transient network error during ICMP sweep
+    } finally {
+      setIsIcmpSweeping(false);
+    }
+  }, []);
+
   useEffect(() => {
     void fetchLiveTelemetry();
     const pollTimer = window.setInterval(() => {
@@ -158,6 +208,24 @@ export default function App() {
     }, 5000);
     return () => window.clearInterval(pollTimer);
   }, [fetchLiveTelemetry]);
+
+  // Poll ICMP Ping for Agentless devices every 10 seconds (and trigger when agentless devices change)
+  const agentlessKey = useMemo(
+    () =>
+      devices
+        .filter((d) => d.agentState === 'agentless')
+        .map((d) => d.id)
+        .join(','),
+    [devices]
+  );
+
+  useEffect(() => {
+    void fetchAgentlessIcmpPing();
+    const icmpTimer = window.setInterval(() => {
+      void fetchAgentlessIcmpPing();
+    }, 10000);
+    return () => window.clearInterval(icmpTimer);
+  }, [fetchAgentlessIcmpPing, agentlessKey]);
 
   // Poll /api/v1/scan/status every 300ms while a subnet scan is actively running
   useEffect(() => {
@@ -203,9 +271,30 @@ export default function App() {
         query: searchQuery,
         statusFilter,
         agentFilter,
+        osFilter,
       }),
-    [devices, searchQuery, statusFilter, agentFilter]
+    [devices, searchQuery, statusFilter, agentFilter, osFilter]
   );
+
+  const sortedDevices = useMemo(
+    () => sortDevices(filteredDevices, sortField, sortDirection, icmpPingMap),
+    [filteredDevices, sortField, sortDirection, icmpPingMap]
+  );
+
+  const pagination = useMemo(
+    () => paginateDevices(sortedDevices, currentPage, pageSize),
+    [sortedDevices, currentPage, pageSize]
+  );
+
+  const handleSortColumn = (field: InventorySortField) => {
+    if (sortField === field) {
+      setSortDirection((prev) => (prev === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setSortField(field);
+      setSortDirection('asc');
+    }
+    setCurrentPage(1);
+  };
 
   const unreadNotifCount = useMemo(
     () => notifications.filter((n) => !n.read).length,
@@ -223,40 +312,110 @@ export default function App() {
     setIsDeployModalOpen(true);
   };
 
-  const handleConfirmDeploy = async (targetIds: string[], credentialId: string) => {
-    setDevices((prev) => applyAgentDeployment(prev, targetIds, 'v2.4.1-go'));
+  const handleConfirmDeploy = async (
+    targetIds: string[],
+    credentialId: string,
+    targetDevicesList: DeviceAsset[]
+  ): Promise<DeployExecutionResult> => {
+    const targetsPayload = targetDevicesList.map((d) => ({
+      id: d.id,
+      ipAddress: d.ipAddress,
+      hostname: d.hostname,
+      os: d.os,
+    }));
 
     try {
-      await fetch(`${API_BASE}/api/v1/deploy`, {
+      const res = await fetch(`${API_BASE}/api/v1/deploy`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ targetIds, credentialId }),
+        body: JSON.stringify({
+          targetIds,
+          targets: targetsPayload,
+          credentialId,
+        }),
       });
+
+      const data = (await res.json().catch(() => ({}))) as DeployExecutionResult;
       await fetchLiveTelemetry();
-    } catch {
-      // Fallback local state already updated
+
+      const succeededIds = Array.isArray(data.deployedIds) ? data.deployedIds : [];
+
+      if (res.ok && data.status === 'deployed' && succeededIds.length > 0) {
+        setDevices((prev) => applyAgentDeployment(prev, succeededIds, 'v2.4.1-go'));
+
+        const deployedNames = targetDevicesList
+          .filter((d) => succeededIds.includes(d.id))
+          .map((d) => `${d.hostname} (${d.ipAddress})`)
+          .join(', ');
+
+        setNotifications((prev) => [
+          {
+            id: `notif-${Date.now()}`,
+            timestamp: 'Just now',
+            severity: 'success',
+            titleId: `Push Deployment Berhasil (${succeededIds.length} Host)`,
+            titleEn: `Push Deployment Succeeded (${succeededIds.length} Hosts)`,
+            descId: `Agen Go v2.4.1 aktif pada: ${deployedNames}. Memory cap: ${engineConfig.maxAgentRamMb} MB.`,
+            descEn: `Go Agent v2.4.1 active on: ${deployedNames}. Memory cap: ${engineConfig.maxAgentRamMb} MB.`,
+            read: false,
+          },
+          ...prev,
+        ]);
+
+        setSelectedDeviceIds((prev) => prev.filter((id) => !succeededIds.includes(id)));
+
+        return {
+          status: 'deployed',
+          deployedCount: data.deployedCount ?? succeededIds.length,
+          failedCount: data.failedCount ?? 0,
+          deployedIds: succeededIds,
+          logs: data.logs || [],
+        };
+      }
+
+      const failedTargetsStr = targetDevicesList
+        .map((d) => `${d.hostname} (${d.ipAddress})`)
+        .join(', ');
+
+      setNotifications((prev) => [
+        {
+          id: `notif-${Date.now()}`,
+          timestamp: 'Just now',
+          severity: 'warning',
+          titleId: `Push Deployment Gagal (${targetDevicesList.length} Host)`,
+          titleEn: `Push Deployment Failed (${targetDevicesList.length} Hosts)`,
+          descId:
+            data.error ||
+            `Gagal menghubungi atau mengautentikasi target: ${failedTargetsStr}. Status tetap Agentless.`,
+          descEn:
+            data.error ||
+            `Failed to reach or authenticate target: ${failedTargetsStr}. Status remains Agentless.`,
+          read: false,
+        },
+        ...prev,
+      ]);
+
+      return {
+        status: 'failed',
+        deployedCount: 0,
+        failedCount: data.failedCount ?? targetDevicesList.length,
+        deployedIds: [],
+        logs: data.logs || [],
+        error:
+          data.error ||
+          `Koneksi / otentikasi WinRM/SSH ke ${failedTargetsStr} gagal.`,
+      };
+    } catch (err) {
+      const errMsg = (err as Error).message || 'Gagal menghubungi /api/v1/deploy';
+      return {
+        status: 'failed',
+        deployedCount: 0,
+        failedCount: targetDevicesList.length,
+        deployedIds: [],
+        logs: [`[ERROR] Gagal menghubungi endpoint /api/v1/deploy: ${errMsg}`],
+        error: errMsg,
+      };
     }
-
-    const deployedNames = devices
-      .filter((d) => targetIds.includes(d.id))
-      .map((d) => d.hostname)
-      .join(', ');
-
-    setNotifications((prev) => [
-      {
-        id: `notif-${Date.now()}`,
-        timestamp: 'Just now',
-        severity: 'success',
-        titleId: `Push Deployment Berhasil (${targetIds.length} Host)`,
-        titleEn: `Push Deployment Succeeded (${targetIds.length} Hosts)`,
-        descId: `Agen Go v2.4.1 aktif pada: ${deployedNames}. Memory cap: ${engineConfig.maxAgentRamMb} MB.`,
-        descEn: `Go Agent v2.4.1 active on: ${deployedNames}. Memory cap: ${engineConfig.maxAgentRamMb} MB.`,
-        read: false,
-      },
-      ...prev,
-    ]);
-
-    setSelectedDeviceIds((prev) => prev.filter((id) => !targetIds.includes(id)));
   };
 
   const handleRunSubnetScan = async (e: React.FormEvent) => {
@@ -413,6 +572,7 @@ export default function App() {
       // Immediately reset local state to 0 devices and refresh from backend
       setDevices([]);
       setLogs([]);
+      setIcmpPingMap({});
       setSelectedDeviceIds([]);
       setInspectDevice(null);
       setScanProgress(null);
@@ -931,7 +1091,10 @@ export default function App() {
                         type="search"
                         aria-label="Search Hostname, IP, MAC, or OS"
                         value={searchQuery}
-                        onChange={(e) => setSearchQuery(e.target.value)}
+                        onChange={(e) => {
+                          setSearchQuery(e.target.value);
+                          setCurrentPage(1);
+                        }}
                         placeholder={
                           lang === 'id'
                             ? 'Cari Hostname, IP, MAC, OS...'
@@ -941,6 +1104,26 @@ export default function App() {
                       />
                     </div>
 
+                    {/* OS Type Dropdown Filter */}
+                    <select
+                      id="os-type-filter"
+                      aria-label="Filter by OS Type"
+                      value={osFilter}
+                      onChange={(e) => {
+                        setOsFilter(e.target.value);
+                        setCurrentPage(1);
+                      }}
+                      className="px-3 py-1.5 text-xs bg-[#0B0F17] border border-[#1E293B] rounded-lg text-slate-200 focus:outline-none focus:border-emerald-500 cursor-pointer"
+                    >
+                      <option value="all">
+                        {lang === 'id' ? 'Semua OS (All)' : 'All OS Types'}
+                      </option>
+                      <option value="windows">Windows (Server / 11 / 10)</option>
+                      <option value="linux">Linux (Ubuntu / RHEL / Debian)</option>
+                      <option value="macos">macOS (Apple Silicon / Intel)</option>
+                      <option value="network">Network OS (Cisco / MikroTik)</option>
+                    </select>
+
                     {/* Interactive Filter Buttons */}
                     <div className="flex items-center gap-1 bg-[#0B0F17] p-1 rounded-lg border border-[#1E293B]">
                       {(['all', 'active', 'agentless', 'snmp-only'] as const).map(
@@ -948,7 +1131,10 @@ export default function App() {
                           <button
                             key={af}
                             type="button"
-                            onClick={() => setAgentFilter(af)}
+                            onClick={() => {
+                              setAgentFilter(af);
+                              setCurrentPage(1);
+                            }}
                             className={`px-2.5 py-1 text-xs font-medium rounded transition-colors whitespace-nowrap cursor-pointer ${
                               agentFilter === af
                                 ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
@@ -968,6 +1154,20 @@ export default function App() {
                         )
                       )}
                     </div>
+
+                    <button
+                      type="button"
+                      onClick={() => void fetchAgentlessIcmpPing()}
+                      title="Real-Time Agentless ICMP Ping Status (Updates every 10s)"
+                      className="px-2.5 py-1.5 text-xs font-mono text-slate-300 hover:text-white bg-[#0B0F17] border border-[#1E293B] rounded-lg transition-colors flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
+                    >
+                      <Wifi
+                        className={`w-3.5 h-3.5 text-emerald-400 ${
+                          isIcmpSweeping ? 'animate-pulse' : ''
+                        }`}
+                      />
+                      <span>ICMP 10s ({lastIcmpSweepAt})</span>
+                    </button>
 
                     {selectedDeviceIds.length > 0 && (
                       <button
@@ -992,16 +1192,94 @@ export default function App() {
                         <th className="py-2.5 px-3 w-8">
                           <span className="sr-only">Pilih</span>
                         </th>
-                        <th className="py-2.5 px-3">Hostname &amp; Lokasi</th>
-                        <th className="py-2.5 px-3">IPv4 &amp; MAC</th>
+                        <th
+                          className="py-2.5 px-3"
+                          aria-sort={
+                            sortField === 'hostname'
+                              ? sortDirection === 'asc'
+                                ? 'ascending'
+                                : 'descending'
+                              : 'none'
+                          }
+                        >
+                          <button
+                            type="button"
+                            onClick={() => handleSortColumn('hostname')}
+                            className="inline-flex items-center gap-1.5 font-semibold text-slate-300 hover:text-white transition-colors cursor-pointer whitespace-nowrap"
+                          >
+                            <span>Hostname &amp; Lokasi</span>
+                            {sortField === 'hostname' ? (
+                              sortDirection === 'asc' ? (
+                                <ArrowUp className="w-3.5 h-3.5 text-emerald-400" />
+                              ) : (
+                                <ArrowDown className="w-3.5 h-3.5 text-emerald-400" />
+                              )
+                            ) : (
+                              <ArrowUpDown className="w-3.5 h-3.5 text-slate-500" />
+                            )}
+                          </button>
+                        </th>
+                        <th
+                          className="py-2.5 px-3"
+                          aria-sort={
+                            sortField === 'ip'
+                              ? sortDirection === 'asc'
+                                ? 'ascending'
+                                : 'descending'
+                              : 'none'
+                          }
+                        >
+                          <button
+                            type="button"
+                            onClick={() => handleSortColumn('ip')}
+                            className="inline-flex items-center gap-1.5 font-semibold text-slate-300 hover:text-white transition-colors cursor-pointer whitespace-nowrap"
+                          >
+                            <span>IPv4 &amp; MAC</span>
+                            {sortField === 'ip' ? (
+                              sortDirection === 'asc' ? (
+                                <ArrowUp className="w-3.5 h-3.5 text-emerald-400" />
+                              ) : (
+                                <ArrowDown className="w-3.5 h-3.5 text-emerald-400" />
+                              )
+                            ) : (
+                              <ArrowUpDown className="w-3.5 h-3.5 text-slate-500" />
+                            )}
+                          </button>
+                        </th>
                         <th className="py-2.5 px-3">Sistem Operasi</th>
-                        <th className="py-2.5 px-3">Status &amp; Kolektor</th>
+                        <th
+                          className="py-2.5 px-3"
+                          aria-sort={
+                            sortField === 'status'
+                              ? sortDirection === 'asc'
+                                ? 'ascending'
+                                : 'descending'
+                              : 'none'
+                          }
+                        >
+                          <button
+                            type="button"
+                            onClick={() => handleSortColumn('status')}
+                            className="inline-flex items-center gap-1.5 font-semibold text-slate-300 hover:text-white transition-colors cursor-pointer whitespace-nowrap"
+                          >
+                            <span>Status &amp; Kolektor</span>
+                            {sortField === 'status' ? (
+                              sortDirection === 'asc' ? (
+                                <ArrowUp className="w-3.5 h-3.5 text-emerald-400" />
+                              ) : (
+                                <ArrowDown className="w-3.5 h-3.5 text-emerald-400" />
+                              )
+                            ) : (
+                              <ArrowUpDown className="w-3.5 h-3.5 text-slate-500" />
+                            )}
+                          </button>
+                        </th>
                         <th className="py-2.5 px-3 text-right">CPU / RAM</th>
                         <th className="py-2.5 px-3 text-right">Aksi Deployment</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-[#1E293B]">
-                      {filteredDevices.length === 0 ? (
+                      {pagination.pageItems.length === 0 ? (
                         <tr>
                           <td colSpan={7} className="py-10 px-4 text-center">
                             <div className="max-w-lg mx-auto space-y-2">
@@ -1019,11 +1297,16 @@ export default function App() {
                           </td>
                         </tr>
                       ) : (
-                        filteredDevices.map((dev) => {
+                        pagination.pageItems.map((dev) => {
                           const isChecked = selectedDeviceIds.includes(dev.id);
-                          const ramPct = Math.round(
-                            (dev.ramUsedGb / Math.max(1, dev.ramTotalGb)) * 100
-                          );
+                          const isAgentActive = dev.agentState === 'active';
+                          const cpuVal = isAgentActive ? dev.cpuUsagePct : 0;
+                          const ramUsedVal = isAgentActive ? dev.ramUsedGb : 0;
+                          const ramTotalVal = isAgentActive ? dev.ramTotalGb : 0;
+                          const ramPct =
+                            isAgentActive && ramTotalVal > 0
+                              ? Math.round((ramUsedVal / ramTotalVal) * 100)
+                              : 0;
 
                           return (
                             <tr
@@ -1064,44 +1347,97 @@ export default function App() {
                               </td>
 
                               <td className="py-3 px-3">
-                                <div className="flex items-center gap-1.5">
-                                  {dev.status === 'warning' ? (
-                                    <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
-                                  ) : (
-                                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                                  )}
-                                  <span
-                                    className={
-                                      dev.status === 'warning'
-                                        ? 'text-rose-400 font-medium'
-                                        : 'text-emerald-400 font-medium'
-                                    }
-                                  >
-                                    {dev.status.toUpperCase()}
-                                  </span>
-                                  <span className="text-slate-500">·</span>
-                                  <span className="font-mono text-slate-300">
-                                    {dev.agentState === 'active'
-                                      ? `Agent ${dev.agentVersion} (${dev.agentMemoryMb}MB)`
-                                      : dev.agentState === 'snmp-only'
-                                      ? 'SNMPv3 Poll'
-                                      : 'Agentless'}
-                                  </span>
-                                </div>
+                                {dev.agentState === 'agentless' ? (
+                                  (() => {
+                                    const icmp = formatIcmpPingStatus(
+                                      icmpPingMap[dev.id],
+                                      dev.latencyMs,
+                                      dev.status
+                                    );
+                                    return (
+                                      <div
+                                        data-testid={`agentless-icmp-status-${dev.id}`}
+                                        className="space-y-0.5"
+                                      >
+                                        <div className="flex items-center gap-1.5">
+                                          {icmp.alive ? (
+                                            <Wifi
+                                              aria-label="ICMP Ping Reachable (Green)"
+                                              className="w-3.5 h-3.5 text-emerald-400 shrink-0"
+                                            />
+                                          ) : (
+                                            <WifiOff
+                                              aria-label="ICMP Ping Unreachable (Red)"
+                                              className="w-3.5 h-3.5 text-rose-400 shrink-0"
+                                            />
+                                          )}
+                                          <span
+                                            className={
+                                              icmp.alive
+                                                ? 'text-emerald-400 font-semibold font-mono'
+                                                : 'text-rose-400 font-semibold font-mono'
+                                            }
+                                          >
+                                            {lang === 'id' ? icmp.labelId : icmp.labelEn}
+                                          </span>
+                                          <span className="text-slate-500">·</span>
+                                          <span className="font-mono text-slate-300">
+                                            Agentless
+                                          </span>
+                                        </div>
+                                        <div className="text-[11px] font-mono text-slate-400 flex items-center gap-1.5">
+                                          {icmp.alive ? (
+                                            <CheckCircle2 className="w-3 h-3 text-emerald-400 shrink-0" />
+                                          ) : (
+                                            <XCircle className="w-3 h-3 text-rose-400 shrink-0" />
+                                          )}
+                                          <span>
+                                            {icmp.method} · Poll 10s ({icmp.lastPingedAt})
+                                          </span>
+                                        </div>
+                                      </div>
+                                    );
+                                  })()
+                                ) : (
+                                  <div className="flex items-center gap-1.5">
+                                    {dev.status === 'warning' ? (
+                                      <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                                    ) : (
+                                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                                    )}
+                                    <span
+                                      className={
+                                        dev.status === 'warning'
+                                          ? 'text-rose-400 font-medium'
+                                          : 'text-emerald-400 font-medium'
+                                      }
+                                    >
+                                      {dev.status.toUpperCase()}
+                                    </span>
+                                    <span className="text-slate-500">·</span>
+                                    <span className="font-mono text-slate-300">
+                                      {dev.agentState === 'active'
+                                        ? `Agent ${dev.agentVersion} (${dev.agentMemoryMb}MB)`
+                                        : 'SNMPv3 Poll'}
+                                    </span>
+                                  </div>
+                                )}
                               </td>
 
                               <td className="py-3 px-3 text-right font-mono tabular-nums">
                                 <div
                                   className={
-                                    dev.cpuUsagePct > 80
+                                    !isAgentActive
+                                      ? 'text-slate-500'
+                                      : cpuVal > 80
                                       ? 'text-rose-400 font-semibold'
                                       : 'text-slate-200'
                                   }
                                 >
-                                  CPU {dev.cpuUsagePct}%
+                                  CPU {cpuVal}%
                                 </div>
                                 <div className="text-[11px] text-slate-400">
-                                  RAM {ramPct}% ({dev.ramUsedGb}/{dev.ramTotalGb}GB)
+                                  RAM {ramPct}% ({ramUsedVal}/{ramTotalVal}GB)
                                 </div>
                               </td>
 
@@ -1109,11 +1445,13 @@ export default function App() {
                                 <div className="inline-flex items-center justify-end gap-2">
                                   <button
                                     type="button"
+                                    aria-label={`Inspect Heartbeat and Details for ${dev.hostname}`}
                                     onClick={() => setInspectDevice(dev)}
-                                    className="px-2.5 py-1.5 text-xs font-medium text-slate-300 hover:text-white bg-[#0B0F17] border border-[#1E293B] rounded-lg transition-colors inline-flex items-center gap-1 whitespace-nowrap cursor-pointer"
+                                    className="px-2.5 py-1.5 text-xs font-medium text-slate-200 hover:text-white bg-[#0B0F17] border border-[#1E293B] hover:border-emerald-500/50 rounded-lg transition-colors inline-flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
                                   >
-                                    <Eye className="w-3.5 h-3.5" />
-                                    <span>Detail</span>
+                                    <Activity className="w-3.5 h-3.5 text-emerald-400" />
+                                    <Eye className="w-3.5 h-3.5 text-slate-400" />
+                                    <span>Heartbeat &amp; Detail</span>
                                   </button>
 
                                   {dev.agentState === 'agentless' ? (
@@ -1143,6 +1481,128 @@ export default function App() {
                       )}
                     </tbody>
                   </table>
+                </div>
+
+                {/* Pagination & Page Size Control Bar (25, 50, 100, 200, 500 + <, >, and Page Numbers) */}
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pt-3 border-t border-[#1E293B] text-xs">
+                  <div className="flex flex-wrap items-center gap-3 text-slate-400">
+                    <div className="flex items-center gap-2">
+                      <label
+                        htmlFor="inventory-page-size"
+                        className="text-slate-300 font-medium whitespace-nowrap"
+                      >
+                        {lang === 'id' ? 'Maksimal Data:' : 'Show Rows:'}
+                      </label>
+                      <select
+                        id="inventory-page-size"
+                        aria-label="Maksimal Data per Halaman"
+                        value={pageSize}
+                        onChange={(e) => {
+                          setPageSize(Number(e.target.value));
+                          setCurrentPage(1);
+                        }}
+                        className="px-2.5 py-1.5 font-mono tabular-nums bg-[#0B0F17] border border-[#1E293B] rounded-lg text-slate-100 focus:outline-none focus:border-emerald-500 cursor-pointer"
+                      >
+                        {INVENTORY_PAGE_SIZE_OPTIONS.map((size) => (
+                          <option key={size} value={size}>
+                            {size}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <span className="text-slate-500">·</span>
+
+                    <span className="font-mono tabular-nums text-slate-300">
+                      {lang === 'id'
+                        ? `Menampilkan ${pagination.startIndex}–${pagination.endIndex} dari ${pagination.totalItems} perangkat (Hal. ${pagination.currentPage}/${pagination.totalPages})`
+                        : `Showing ${pagination.startIndex}–${pagination.endIndex} of ${pagination.totalItems} devices (Page ${pagination.currentPage}/${pagination.totalPages})`}
+                    </span>
+                  </div>
+
+                  {/* Page Navigation Controls: <, Page Numbers, > */}
+                  <nav
+                    aria-label="Inventory Table Pagination"
+                    className="flex items-center gap-1.5 font-mono tabular-nums"
+                  >
+                    <button
+                      type="button"
+                      aria-label="Previous Page"
+                      disabled={pagination.currentPage <= 1}
+                      onClick={() =>
+                        setCurrentPage((p) => Math.max(1, p - 1))
+                      }
+                      className="px-3 py-1.5 rounded-lg bg-[#0B0F17] border border-[#1E293B] text-slate-200 hover:text-white hover:border-emerald-500/50 disabled:opacity-40 disabled:pointer-events-none transition-colors inline-flex items-center justify-center font-bold cursor-pointer"
+                    >
+                      &lt;
+                    </button>
+
+                    {pagination.pageNumbers[0] > 1 && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => setCurrentPage(1)}
+                          className="px-2.5 py-1.5 rounded-lg bg-[#0B0F17] border border-[#1E293B] text-slate-300 hover:text-white transition-colors cursor-pointer"
+                        >
+                          1
+                        </button>
+                        {pagination.pageNumbers[0] > 2 && (
+                          <span className="px-1 text-slate-500">…</span>
+                        )}
+                      </>
+                    )}
+
+                    {pagination.pageNumbers.map((pageNum) => {
+                      const isCurrent = pageNum === pagination.currentPage;
+                      return (
+                        <button
+                          key={pageNum}
+                          type="button"
+                          aria-label={`Page ${pageNum}`}
+                          aria-current={isCurrent ? 'page' : undefined}
+                          onClick={() => setCurrentPage(pageNum)}
+                          className={`px-3 py-1.5 rounded-lg border transition-colors cursor-pointer ${
+                            isCurrent
+                              ? 'bg-emerald-500 text-slate-950 font-bold border-emerald-400'
+                              : 'bg-[#0B0F17] border-[#1E293B] text-slate-300 hover:text-white hover:border-slate-700'
+                          }`}
+                        >
+                          {pageNum}
+                        </button>
+                      );
+                    })}
+
+                    {pagination.pageNumbers[pagination.pageNumbers.length - 1] <
+                      pagination.totalPages && (
+                      <>
+                        {pagination.pageNumbers[pagination.pageNumbers.length - 1] <
+                          pagination.totalPages - 1 && (
+                          <span className="px-1 text-slate-500">…</span>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => setCurrentPage(pagination.totalPages)}
+                          className="px-2.5 py-1.5 rounded-lg bg-[#0B0F17] border border-[#1E293B] text-slate-300 hover:text-white transition-colors cursor-pointer"
+                        >
+                          {pagination.totalPages}
+                        </button>
+                      </>
+                    )}
+
+                    <button
+                      type="button"
+                      aria-label="Next Page"
+                      disabled={pagination.currentPage >= pagination.totalPages}
+                      onClick={() =>
+                        setCurrentPage((p) =>
+                          Math.min(pagination.totalPages, p + 1)
+                        )
+                      }
+                      className="px-3 py-1.5 rounded-lg bg-[#0B0F17] border border-[#1E293B] text-slate-200 hover:text-white hover:border-emerald-500/50 disabled:opacity-40 disabled:pointer-events-none transition-colors inline-flex items-center justify-center font-bold cursor-pointer"
+                    >
+                      &gt;
+                    </button>
+                  </nav>
                 </div>
               </section>
             </div>
@@ -1212,7 +1672,9 @@ export default function App() {
         credentials={credentials}
         lang={lang}
         onClose={() => setIsDeployModalOpen(false)}
-        onConfirmDeploy={(targetIds, credId) => void handleConfirmDeploy(targetIds, credId)}
+        onConfirmDeploy={(targetIds, credId, targetDevs) =>
+          handleConfirmDeploy(targetIds, credId, targetDevs)
+        }
       />
 
       <DeviceDetailModal

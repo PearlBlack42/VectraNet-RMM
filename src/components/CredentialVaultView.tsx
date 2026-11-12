@@ -89,6 +89,7 @@ export const CredentialVaultView: React.FC<CredentialVaultViewProps> = ({
       lastRotated: new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC',
       createdBy: 'Yesaya42@gmail.com',
       verified: true,
+      rawSecret,
     };
 
     onAddCredential(newEntry);
