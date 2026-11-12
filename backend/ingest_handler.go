@@ -789,6 +789,38 @@ func (s *VectraNetServer) handleGetDevices(w http.ResponseWriter, r *http.Reques
 		devices = append(devices, dev)
 	}
 
+	// Self-heal any existing devices in PostgreSQL that still have a fallback 'HOST-...' or raw IP hostname
+	var healWg sync.WaitGroup
+	var healMu sync.Mutex
+	for idx := range devices {
+		hName := strings.TrimSpace(devices[idx].Hostname)
+		if hName == "" || strings.HasPrefix(strings.ToUpper(hName), "HOST-") || hName == devices[idx].IPAddress {
+			healWg.Add(1)
+			go func(i int) {
+				defer healWg.Done()
+				ip := devices[i].IPAddress
+				resolved := ""
+				if isLocalIPAddress(ip) {
+					if localHost, err := os.Hostname(); err == nil && strings.TrimSpace(localHost) != "" {
+						resolved = strings.TrimSpace(localHost)
+					}
+				}
+				if resolved == "" {
+					resolved = resolveReverseDNS(ip, 650*time.Millisecond)
+				}
+				if resolved != "" && !strings.HasPrefix(strings.ToUpper(resolved), "HOST-") && resolved != ip {
+					healMu.Lock()
+					devices[i].Hostname = resolved
+					healMu.Unlock()
+					bgCtx, bgCancel := context.WithTimeout(context.Background(), 2*time.Second)
+					_, _ = s.dbPool.Exec(bgCtx, `UPDATE devices SET hostname = $2, updated_at = NOW() WHERE id = $1::uuid`, devices[i].ID, resolved)
+					bgCancel()
+				}
+			}(idx)
+		}
+	}
+	healWg.Wait()
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(devices)
 }
@@ -1651,7 +1683,7 @@ func probeRealHost(ip string, localIfaces map[string]localIfaceInfo) (Discovered
 		minLatency = math.Max(0.5, math.Round(float64(time.Since(start).Microseconds())/100.0)/10.0)
 	}
 
-	hostname := resolveReverseDNS(ip, 350*time.Millisecond)
+	hostname := resolveReverseDNS(ip, 900*time.Millisecond)
 	if hostname == "" {
 		hostname = fmt.Sprintf("HOST-%s", strings.ReplaceAll(ip, ".", "-"))
 	}
@@ -1705,16 +1737,23 @@ func (s *VectraNetServer) persistDiscoveredHost(cidr string, h DiscoveredHostRes
 	// First check if a device with this exact IP already exists
 	err := s.dbPool.QueryRow(ctx, `SELECT id::text FROM devices WHERE host(ip_address) = $1 LIMIT 1`, h.IPAddress).Scan(&deviceID)
 	if err == nil && deviceID != "" {
-		// Device already exists for this IP: only refresh last_seen and latency, preserve agent_state & hardware metrics!
+		// Device already exists for this IP:
+		// Upgrade hostname if h.Hostname is a real resolved name (not 'HOST-%') or if existing DB hostname is empty/'HOST-%',
+		// while preserving existing real hostnames, agent_state, and hardware metrics!
 		_, _ = s.dbPool.Exec(ctx, `
 			UPDATE devices SET
+				hostname = CASE
+					WHEN $4 <> '' AND UPPER($4) NOT LIKE 'HOST-%' THEN $4
+					WHEN devices.hostname IS NULL OR devices.hostname = '' OR UPPER(devices.hostname) LIKE 'HOST-%' THEN $4
+					ELSE devices.hostname
+				END,
 				subnet_cidr = $2,
 				latency_ms  = $3,
 				status      = CASE WHEN agent_state = 'active' THEN status ELSE 'online' END,
 				last_seen   = NOW(),
 				updated_at  = NOW()
 			WHERE id = $1::uuid
-		`, deviceID, cidr, h.LatencyMs)
+		`, deviceID, cidr, h.LatencyMs, h.Hostname)
 	} else {
 		// Newly discovered host: insert as 'agentless' with 0 CPU/RAM metrics (no shared telemetry!)
 		err = s.dbPool.QueryRow(ctx, `
@@ -1728,6 +1767,11 @@ func (s *VectraNetServer) persistDiscoveredHost(cidr string, h DiscoveredHostRes
 				'', 0, 0, 0, $7, $8, $9, NOW(), NOW()
 			)
 			ON CONFLICT (mac_address) DO UPDATE SET
+				hostname = CASE
+					WHEN EXCLUDED.hostname <> '' AND UPPER(EXCLUDED.hostname) NOT LIKE 'HOST-%' THEN EXCLUDED.hostname
+					WHEN devices.hostname IS NULL OR devices.hostname = '' OR UPPER(devices.hostname) LIKE 'HOST-%' THEN EXCLUDED.hostname
+					ELSE devices.hostname
+				END,
 				ip_address  = EXCLUDED.ip_address,
 				subnet_cidr = EXCLUDED.subnet_cidr,
 				latency_ms  = EXCLUDED.latency_ms,
@@ -1999,12 +2043,360 @@ func deriveDeterministicMACFromIP(ipStr string) string {
 	return "02:56:00:00:00:01"
 }
 
+// resolveReverseDNS resolves the real device hostname for an IPv4 address using concurrent
+// Reverse DNS PTR lookup, NetBIOS Node Status (UDP 137 NBSTAT), mDNS Reverse PTR (UDP 5353),
+// and OS native name resolution (Windows ping -a / nbtstat -A, Linux/macOS getent).
 func resolveReverseDNS(ip string, timeout time.Duration) string {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	if isLocalIPAddress(ip) {
+		if h, err := os.Hostname(); err == nil && strings.TrimSpace(h) != "" {
+			return strings.TrimSpace(h)
+		}
+	}
+
+	if timeout < 450*time.Millisecond {
+		timeout = 650 * time.Millisecond
+	}
+
+	type resultItem struct {
+		priority int
+		name     string
+	}
+	resCh := make(chan resultItem, 4)
+	var wg sync.WaitGroup
+
+	// 1. Standard Reverse DNS PTR (net.DefaultResolver.LookupAddr)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		names, err := net.DefaultResolver.LookupAddr(ctx, ip)
+		if err == nil && len(names) > 0 {
+			clean := sanitizeResolvedHostname(names[0], ip)
+			if clean != "" {
+				resCh <- resultItem{priority: 1, name: clean}
+			}
+		}
+	}()
+
+	// 2. Native NetBIOS Node Status Query (RFC 1002 NBSTAT over UDP port 137) — fast & accurate for Windows/Samba PCs
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if nbName := queryNetBIOSName(ip, timeout); nbName != "" {
+			clean := sanitizeResolvedHostname(nbName, ip)
+			if clean != "" {
+				resCh <- resultItem{priority: 2, name: clean}
+			}
+		}
+	}()
+
+	// 3. Unicast / Multicast mDNS Reverse PTR Query (UDP port 5353) — resolves .local names on macOS, Linux & Windows 10/11
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if mdnsName := queryMDNSHostname(ip, timeout); mdnsName != "" {
+			clean := sanitizeResolvedHostname(mdnsName, ip)
+			if clean != "" {
+				resCh <- resultItem{priority: 3, name: clean}
+			}
+		}
+	}()
+
+	// 4. OS Command Fallback (Windows ping -a / nbtstat -A, Linux/macOS getent hosts)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if osName := resolveOSCommandHostname(ip, timeout); osName != "" {
+			clean := sanitizeResolvedHostname(osName, ip)
+			if clean != "" {
+				resCh <- resultItem{priority: 4, name: clean}
+			}
+		}
+	}()
+
+	go func() {
+		wg.Wait()
+		close(resCh)
+	}()
+
+	bestPriority := 999
+	bestName := ""
+	for item := range resCh {
+		if item.name != "" && item.priority < bestPriority {
+			bestPriority = item.priority
+			bestName = item.name
+		}
+	}
+	return bestName
+}
+
+func sanitizeResolvedHostname(raw, ip string) string {
+	s := strings.TrimSpace(raw)
+	s = strings.TrimSuffix(s, ".")
+	if s == "" || s == ip || strings.EqualFold(s, "localhost") {
+		return ""
+	}
+	if strings.HasPrefix(strings.ToUpper(s), "HOST-") {
+		return ""
+	}
+	// Strip control characters
+	var b strings.Builder
+	for _, r := range s {
+		if r > 32 && r < 127 {
+			b.WriteRune(r)
+		}
+	}
+	cleaned := b.String()
+	if cleaned == "" || cleaned == ip {
+		return ""
+	}
+	return cleaned
+}
+
+// queryNetBIOSName sends an RFC 1002 NetBIOS Node Status (NBSTAT) UDP packet to <ip>:137
+// and extracts the unique workstation/server NetBIOS name (e.g., edp06, edp07).
+func queryNetBIOSName(ip string, timeout time.Duration) string {
+	conn, err := net.DialTimeout("udp", net.JoinHostPort(ip, "137"), timeout)
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+
+	// 50-byte RFC 1002 NBSTAT wildcard query ("*" padded with 15 null bytes -> CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA)
+	packet := []byte{
+		0x81, 0x28, // Transaction ID
+		0x00, 0x00, // Flags: query
+		0x00, 0x01, // QDCOUNT: 1
+		0x00, 0x00, // ANCOUNT: 0
+		0x00, 0x00, // NSCOUNT: 0
+		0x00, 0x00, // ARCOUNT: 0
+		0x20,       // Name length: 32
+		'C', 'K', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A',
+		'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A', 'A',
+		0x00,       // End of name
+		0x00, 0x21, // QTYPE: NBSTAT (0x0021)
+		0x00, 0x01, // QCLASS: IN (0x0001)
+	}
+
+	if _, err := conn.Write(packet); err != nil {
+		return ""
+	}
+
+	buf := make([]byte, 512)
+	n, err := conn.Read(buf)
+	if err != nil || n < 57 {
+		return ""
+	}
+
+	// Skip 12-byte header, then skip answer RR name
+	idx := 12
+	for idx < n {
+		length := int(buf[idx])
+		if length == 0 {
+			idx++
+			break
+		}
+		if (length & 0xC0) == 0xC0 {
+			idx += 2
+			break
+		}
+		idx += 1 + length
+	}
+
+	// Skip TYPE (2) + CLASS (2) + TTL (4) + RDLENGTH (2) = 10 bytes
+	idx += 10
+	if idx >= n {
+		return ""
+	}
+
+	numNames := int(buf[idx])
+	idx++
+	fallbackCandidate := ""
+
+	for i := 0; i < numNames && idx+18 <= n; i++ {
+		rawName := buf[idx : idx+15]
+		suffix := buf[idx+15]
+		flags := binary.BigEndian.Uint16(buf[idx+16 : idx+18])
+		idx += 18
+
+		isGroup := (flags & 0x8000) != 0
+		if isGroup {
+			continue
+		}
+
+		// Clean ASCII name
+		nameStr := strings.TrimSpace(string(bytes.TrimRight(rawName, "\x00 ")))
+		if nameStr == "" || strings.HasPrefix(nameStr, "__") {
+			continue
+		}
+
+		// 0x00 = Workstation Service, 0x20 = File Server Service
+		if suffix == 0x00 || suffix == 0x20 {
+			return nameStr
+		}
+		if fallbackCandidate == "" {
+			fallbackCandidate = nameStr
+		}
+	}
+
+	return fallbackCandidate
+}
+
+// queryMDNSHostname sends a reverse PTR DNS query over UDP port 5353 to resolve .local hostnames.
+func queryMDNSHostname(ip string, timeout time.Duration) string {
+	parsed := net.ParseIP(ip)
+	if parsed == nil || parsed.To4() == nil {
+		return ""
+	}
+	b := parsed.To4()
+	labels := []string{
+		strconv.Itoa(int(b[3])),
+		strconv.Itoa(int(b[2])),
+		strconv.Itoa(int(b[1])),
+		strconv.Itoa(int(b[0])),
+		"in-addr",
+		"arpa",
+	}
+
+	var pkt bytes.Buffer
+	pkt.Write([]byte{
+		0x12, 0x34, // ID
+		0x00, 0x00, // Standard query
+		0x00, 0x01, // QDCOUNT = 1
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	})
+	for _, lbl := range labels {
+		pkt.WriteByte(byte(len(lbl)))
+		pkt.WriteString(lbl)
+	}
+	pkt.WriteByte(0x00)
+	pkt.Write([]byte{
+		0x00, 0x0C, // QTYPE = PTR (12)
+		0x00, 0x01, // QCLASS = IN (1)
+	})
+
+	conn, err := net.DialTimeout("udp", net.JoinHostPort(ip, "5353"), timeout)
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+
+	if _, err := conn.Write(pkt.Bytes()); err != nil {
+		return ""
+	}
+
+	resp := make([]byte, 512)
+	n, err := conn.Read(resp)
+	if err != nil || n < 12 {
+		return ""
+	}
+	ancount := binary.BigEndian.Uint16(resp[6:8])
+	if ancount == 0 {
+		return ""
+	}
+
+	// Skip header (12) and question section
+	pos := 12
+	for pos < n && resp[pos] != 0 {
+		if (resp[pos] & 0xC0) == 0xC0 {
+			pos += 2
+			goto afterQuestion
+		}
+		pos += 1 + int(resp[pos])
+	}
+	pos++
+afterQuestion:
+	pos += 4 // QTYPE + QCLASS
+
+	// Read first answer RR
+	if pos >= n {
+		return ""
+	}
+	for pos < n && resp[pos] != 0 {
+		if (resp[pos] & 0xC0) == 0xC0 {
+			pos += 2
+			goto afterAnswerName
+		}
+		pos += 1 + int(resp[pos])
+	}
+	pos++
+afterAnswerName:
+	if pos+10 > n {
+		return ""
+	}
+	rtype := binary.BigEndian.Uint16(resp[pos : pos+2])
+	rdLen := int(binary.BigEndian.Uint16(resp[pos+8 : pos+10]))
+	pos += 10
+	if rtype != 12 || pos+rdLen > n {
+		return ""
+	}
+
+	return decodeDNSName(resp[:n], pos)
+}
+
+func decodeDNSName(msg []byte, offset int) string {
+	var parts []string
+	visited := 0
+	curr := offset
+	for curr < len(msg) && visited < 16 {
+		visited++
+		l := int(msg[curr])
+		if l == 0 {
+			break
+		}
+		if (l & 0xC0) == 0xC0 {
+			if curr+1 >= len(msg) {
+				break
+			}
+			ptr := int(binary.BigEndian.Uint16(msg[curr:curr+2]) & 0x3FFF)
+			curr = ptr
+			continue
+		}
+		if curr+1+l > len(msg) {
+			break
+		}
+		parts = append(parts, string(msg[curr+1:curr+1+l]))
+		curr += 1 + l
+	}
+	return strings.Join(parts, ".")
+}
+
+var winPingHostRegex = regexp.MustCompile(`(?i)pinging\s+([^\s\[\]]+)\s+\[\d+\.\d+\.\d+\.\d+\]`)
+var nbtstatRowRegex = regexp.MustCompile(`(?m)^\s*([A-Za-z0-9\-_]{1,15})\s+<00>\s+UNIQUE`)
+
+func resolveOSCommandHostname(ip string, timeout time.Duration) string {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout+250*time.Millisecond)
 	defer cancel()
-	names, err := net.DefaultResolver.LookupAddr(ctx, ip)
-	if err == nil && len(names) > 0 {
-		return strings.TrimSuffix(names[0], ".")
+
+	if runtime.GOOS == "windows" {
+		// 1. Windows 'ping -a -n 1 -w 450 <ip>' resolves via DNS + LLMNR + NetBIOS + Hosts
+		out, _ := exec.CommandContext(ctx, "ping", "-a", "-n", "1", "-w", "450", ip).CombinedOutput()
+		if m := winPingHostRegex.FindStringSubmatch(string(out)); len(m) >= 2 {
+			candidate := strings.TrimSpace(m[1])
+			if candidate != "" && candidate != ip {
+				return candidate
+			}
+		}
+		// 2. Windows 'nbtstat -A <ip>' fallback
+		nbtOut, _ := exec.CommandContext(ctx, "nbtstat", "-A", ip).CombinedOutput()
+		if m := nbtstatRowRegex.FindStringSubmatch(string(nbtOut)); len(m) >= 2 {
+			candidate := strings.TrimSpace(m[1])
+			if candidate != "" && candidate != ip {
+				return candidate
+			}
+		}
+		return ""
+	}
+
+	// Linux / macOS: try 'getent hosts <ip>'
+	if out, err := exec.CommandContext(ctx, "getent", "hosts", ip).CombinedOutput(); err == nil {
+		fields := strings.Fields(string(out))
+		if len(fields) >= 2 && fields[1] != ip {
+			return fields[1]
+		}
 	}
 	return ""
 }

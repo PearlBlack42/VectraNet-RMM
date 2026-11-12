@@ -4,6 +4,8 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
 import net from 'node:net';
+import dns from 'node:dns';
+import dgram from 'node:dgram';
 import fs from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -617,6 +619,138 @@ function deriveMacFromIp(ip: string): string {
   return '02:56:00:00:00:01';
 }
 
+function queryNetBiosNodeName(ip: string, timeoutMs = 480): Promise<string> {
+  return new Promise((resolve) => {
+    const sock = dgram.createSocket('udp4');
+    let settled = false;
+    const finish = (name: string) => {
+      if (settled) return;
+      settled = true;
+      try {
+        sock.close();
+      } catch {
+        // ignore
+      }
+      resolve(name);
+    };
+
+    const timer = setTimeout(() => finish(''), timeoutMs);
+
+    // 50-byte RFC 1002 NBSTAT wildcard query
+    const pkt = Buffer.from([
+      0x81, 0x28, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x20,
+      0x43, 0x4b, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+      0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41, 0x41,
+      0x00,
+      0x00, 0x21, 0x00, 0x01,
+    ]);
+
+    sock.once('error', () => {
+      clearTimeout(timer);
+      finish('');
+    });
+
+    sock.once('message', (msg) => {
+      clearTimeout(timer);
+      if (msg.length < 57) {
+        finish('');
+        return;
+      }
+      let idx = 12;
+      while (idx < msg.length) {
+        const len = msg[idx];
+        if (len === 0) {
+          idx++;
+          break;
+        }
+        if ((len & 0xc0) === 0xc0) {
+          idx += 2;
+          break;
+        }
+        idx += 1 + len;
+      }
+      idx += 10;
+      if (idx >= msg.length) {
+        finish('');
+        return;
+      }
+      const numNames = msg[idx];
+      idx++;
+      let fallback = '';
+      for (let i = 0; i < numNames && idx + 18 <= msg.length; i++) {
+        const raw = msg.subarray(idx, idx + 15).toString('ascii').replace(/[\x00 ]+$/g, '').trim();
+        const suffix = msg[idx + 15];
+        const flags = msg.readUInt16BE(idx + 16);
+        idx += 18;
+        const isGroup = (flags & 0x8000) !== 0;
+        if (isGroup || !raw || raw.startsWith('__')) continue;
+        if (suffix === 0x00 || suffix === 0x20) {
+          finish(raw);
+          return;
+        }
+        if (!fallback) fallback = raw;
+      }
+      finish(fallback);
+    });
+
+    sock.send(pkt, 137, ip, (err) => {
+      if (err) {
+        clearTimeout(timer);
+        finish('');
+      }
+    });
+  });
+}
+
+async function resolveRealHostnameNode(ip: string, isSelfHost: boolean): Promise<string> {
+  if (isSelfHost) {
+    return os.hostname();
+  }
+
+  // 1. Try Reverse DNS PTR and NetBIOS UDP/137 in parallel
+  const ptrPromise = Promise.race([
+    dns.promises
+      .reverse(ip)
+      .then((names) => (names && names.length > 0 ? names[0].replace(/\.$/, '').trim() : ''))
+      .catch(() => ''),
+    new Promise<string>((r) => setTimeout(() => r(''), 550)),
+  ]);
+
+  const nbPromise = queryNetBiosNodeName(ip, 500);
+
+  const [ptrName, nbName] = await Promise.all([ptrPromise, nbPromise]);
+  if (ptrName && ptrName !== ip && !ptrName.toUpperCase().startsWith('HOST-')) {
+    return ptrName;
+  }
+  if (nbName && nbName !== ip && !nbName.toUpperCase().startsWith('HOST-')) {
+    return nbName;
+  }
+
+  // 2. OS command fallback (Windows 'ping -a' or Linux 'getent hosts')
+  try {
+    if (os.platform() === 'win32') {
+      const { stdout } = await execFileAsync('ping', ['-a', '-n', '1', '-w', '450', ip], {
+        timeout: 700,
+      });
+      const m = stdout.match(/Pinging\s+([^\s\[\]]+)\s+\[\d+\.\d+\.\d+\.\d+\]/i);
+      if (m && m[1] && m[1] !== ip) {
+        return m[1].trim();
+      }
+    } else {
+      const { stdout } = await execFileAsync('getent', ['hosts', ip], { timeout: 500 });
+      const parts = stdout.trim().split(/\s+/);
+      if (parts.length >= 2 && parts[1] !== ip && parts[1].toLowerCase() !== 'localhost') {
+        return parts[1].trim();
+      }
+    }
+  } catch {
+    // Ignore OS command fallback errors
+  }
+
+  return `HOST-${ip.replace(/\./g, '-')}`;
+}
+
 async function runRealSubnetSweepNode(jobId: string, cidr: string, ips: string[]) {
   const startTime = Date.now();
   const localIfaces = getLocalNetworkInterfaces();
@@ -684,9 +818,7 @@ async function runRealSubnetSweepNode(jobId: string, cidr: string, ips: string[]
         }
 
         const isSelfHost = Boolean(selfIface || ip === '127.0.0.1');
-        const hostname = isSelfHost
-          ? os.hostname()
-          : `HOST-${ip.replace(/\./g, '-')}`;
+        const resolvedName = await resolveRealHostnameNode(ip, isSelfHost);
 
         const hasWinPorts = openPorts.some((p) => [135, 445, 3389, 5985].includes(p));
         const detectedOs = hasWinPorts
@@ -703,10 +835,20 @@ async function runRealSubnetSweepNode(jobId: string, cidr: string, ips: string[]
         const prev = existingIdx >= 0 ? liveDevices[existingIdx] : undefined;
         const isAlreadyActive = prev?.agentState === 'active';
 
+        // Prefer real resolved hostname over fallback 'HOST-...' while preserving existing real hostnames
+        const prevHasRealHostname =
+          Boolean(prev?.hostname) && !prev!.hostname.toUpperCase().startsWith('HOST-');
+        const resolvedIsReal = !resolvedName.toUpperCase().startsWith('HOST-');
+        const finalHostname = resolvedIsReal
+          ? resolvedName
+          : prevHasRealHostname
+          ? prev!.hostname
+          : resolvedName;
+
         // Discovered hosts without an active agent MUST stay 'agentless' with 0% CPU and 0 GB RAM (never copying another host's metrics!)
         const deviceRecord: DeviceAsset = {
           id: prev?.id || `dev-real-${Date.now()}-${scanned}`,
-          hostname: isAlreadyActive ? prev.hostname : hostname,
+          hostname: finalHostname,
           ipAddress: ip,
           macAddress: isAlreadyActive ? prev.macAddress : mac,
           os: isAlreadyActive ? prev.os : detectedOs,

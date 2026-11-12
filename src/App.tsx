@@ -133,7 +133,32 @@ export default function App() {
       if (devRes.ok) {
         const devData = (await devRes.json()) as DeviceAsset[];
         if (Array.isArray(devData)) {
-          setDevices(devData);
+          setDevices((prevDevices) => {
+            if (prevDevices.length === 0) return devData;
+            const prevByIp = new Map<string, DeviceAsset>();
+            for (const p of prevDevices) {
+              prevByIp.set(p.ipAddress, p);
+            }
+            return devData.map((d) => {
+              const incomingName = (d.hostname || '').trim();
+              const incomingIsFallback =
+                !incomingName ||
+                incomingName.toUpperCase().startsWith('HOST-') ||
+                incomingName === d.ipAddress;
+              if (incomingIsFallback) {
+                const prev = prevByIp.get(d.ipAddress);
+                const prevName = (prev?.hostname || '').trim();
+                if (
+                  prevName &&
+                  !prevName.toUpperCase().startsWith('HOST-') &&
+                  prevName !== d.ipAddress
+                ) {
+                  return { ...d, hostname: prevName };
+                }
+              }
+              return d;
+            });
+          });
         }
       }
 

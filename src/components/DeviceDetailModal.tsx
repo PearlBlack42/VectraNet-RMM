@@ -68,6 +68,18 @@ export const DeviceDetailModal: React.FC<DeviceDetailModalProps> = ({
     return () => window.clearInterval(timer);
   }, [device?.id, fetchDeviceMetrics]);
 
+  // Allow closing the modal anytime via Escape key
+  useEffect(() => {
+    if (!device) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [device, onClose]);
+
   const points: DeviceMetricPoint[] = useMemo(() => {
     if (historyData && Array.isArray(historyData.points) && historyData.points.length > 0) {
       return historyData.points;
@@ -151,18 +163,22 @@ export const DeviceDetailModal: React.FC<DeviceDetailModalProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-xs p-4"
       role="dialog"
       aria-modal="true"
       aria-labelledby="device-detail-title"
+      onClick={onClose}
     >
-      <div className="w-full max-w-4xl bg-[#161F30] border border-[#1E293B] rounded-xl p-6 space-y-5 shadow-2xl max-h-[90vh] overflow-y-auto">
-        {/* Modal Header */}
-        <div className="flex items-start justify-between gap-4 border-b border-[#1E293B] pb-4">
-          <div>
+      <div
+        className="relative w-full max-w-4xl bg-[#161F30] border border-[#1E293B] rounded-xl shadow-2xl max-h-[90vh] flex flex-col overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Sticky Modal Header with Prominent Top-Right Close (X) Button */}
+        <div className="sticky top-0 z-30 flex items-start justify-between gap-4 bg-[#161F30]/95 backdrop-blur-md border-b border-[#1E293B] px-6 py-4 shrink-0">
+          <div className="min-w-0">
             <div className="flex items-center gap-2.5">
               <Activity className="w-5 h-5 text-emerald-400 shrink-0" />
-              <h2 id="device-detail-title" className="text-base font-semibold text-white">
+              <h2 id="device-detail-title" className="text-base font-semibold text-white truncate">
                 {device.hostname} —{' '}
                 {lang === 'id'
                   ? 'Detail Perangkat & Grafik Heartbeat Historis (1 Jam)'
@@ -189,11 +205,11 @@ export const DeviceDetailModal: React.FC<DeviceDetailModalProps> = ({
               </span>
             </p>
           </div>
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex items-center gap-2.5 shrink-0">
             <button
               type="button"
               onClick={() => void fetchDeviceMetrics(device.id)}
-              className="px-3 py-1.5 text-xs font-mono text-slate-200 hover:text-white bg-[#0B0F17] border border-[#1E293B] rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
+              className="px-3 py-1.5 text-xs font-mono text-slate-200 hover:text-white bg-[#0B0F17] border border-[#1E293B] hover:border-slate-600 rounded-lg transition-colors flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
             >
               <RefreshCw
                 className={`w-3.5 h-3.5 text-emerald-400 ${
@@ -205,16 +221,20 @@ export const DeviceDetailModal: React.FC<DeviceDetailModalProps> = ({
             <button
               type="button"
               aria-label="Close Device Detail Modal"
+              title={lang === 'id' ? 'Tutup Modal (ESC)' : 'Close Modal (ESC)'}
               onClick={onClose}
-              className="p-1.5 text-slate-400 hover:text-white rounded-lg cursor-pointer"
+              className="px-3 py-1.5 text-xs font-semibold bg-rose-500/15 hover:bg-rose-500 text-rose-300 hover:text-white border border-rose-500/40 rounded-lg transition-colors inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
             >
-              <X className="w-4 h-4" />
+              <X className="w-4 h-4 stroke-[2.5]" />
+              <span>{lang === 'id' ? 'Tutup' : 'Close'}</span>
             </button>
           </div>
         </div>
 
-        {/* Dedicated Historical 'Heartbeat' Chart Section (Last 60 Minutes CPU & RAM) */}
-        <section
+        {/* Scrollable Modal Body */}
+        <div className="p-6 space-y-5 overflow-y-auto flex-1">
+          {/* Dedicated Historical 'Heartbeat' Chart Section (Last 60 Minutes CPU & RAM) */}
+          <section
           aria-label="Historical Heartbeat Chart"
           className="p-4 rounded-xl bg-[#0B0F17] border border-[#1E293B] space-y-4"
         >
@@ -593,7 +613,26 @@ export const DeviceDetailModal: React.FC<DeviceDetailModalProps> = ({
             </table>
           </div>
         </div>
+        </div>
+
+        {/* Sticky Modal Footer with Close Button */}
+        <div className="sticky bottom-0 z-30 flex items-center justify-between gap-4 bg-[#0B0F17]/95 backdrop-blur-md border-t border-[#1E293B] px-6 py-3 shrink-0 text-xs">
+          <span className="font-mono text-slate-400">
+            {lang === 'id'
+              ? 'Tekan tombol ESC atau klik Tutup untuk kembali ke tabel inventaris.'
+              : 'Press ESC or click Close to return to the inventory table.'}
+          </span>
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-4 py-1.5 text-xs font-semibold bg-[#161F30] hover:bg-rose-500 text-slate-200 hover:text-white border border-[#1E293B] hover:border-rose-500 rounded-lg transition-colors inline-flex items-center gap-1.5 cursor-pointer"
+          >
+            <X className="w-3.5 h-3.5" />
+            <span>{lang === 'id' ? 'Tutup Detail Perangkat' : 'Close Device Details'}</span>
+          </button>
+        </div>
       </div>
     </div>
   );
 };
+
