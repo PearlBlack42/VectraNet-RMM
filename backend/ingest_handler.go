@@ -1887,10 +1887,14 @@ func enumerateCIDRHosts(cidrStr string, maxHosts int) ([]string, string, error) 
 	return hosts, fmt.Sprintf("%s/%d", networkIP.String(), ones), nil
 }
 
-func runSystemPing(ip string, timeout time.Duration) bool {
+var pingTimeRegex = regexp.MustCompile(`(?i)time[=<]\s*([0-9]+(?:\.[0-9]+)?)\s*ms`)
+
+// tryICMPPing executes a single OS ICMP Echo request and returns (alive bool, rttMs float64).
+func tryICMPPing(ip string, timeout time.Duration) (bool, float64) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout+250*time.Millisecond)
 	defer cancel()
 
+	t0 := time.Now()
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
 		ms := maxInt(200, int(timeout.Milliseconds()))
@@ -1902,11 +1906,28 @@ func runSystemPing(ip string, timeout time.Duration) bool {
 	}
 
 	out, err := cmd.CombinedOutput()
+	elapsedMs := math.Round(float64(time.Since(t0).Microseconds())/100.0) / 10.0
+	if elapsedMs < 0.2 {
+		elapsedMs = 0.2
+	}
 	if err != nil {
-		return false
+		return false, 0.0
 	}
 	lower := strings.ToLower(string(out))
-	return strings.Contains(lower, "ttl=") || strings.Contains(lower, "bytes from")
+	if !strings.Contains(lower, "ttl=") && !strings.Contains(lower, "bytes from") {
+		return false, 0.0
+	}
+	if m := pingTimeRegex.FindStringSubmatch(lower); len(m) >= 2 {
+		if parsed, pErr := strconv.ParseFloat(m[1], 64); pErr == nil && parsed > 0 {
+			return true, math.Round(parsed*10) / 10
+		}
+	}
+	return true, elapsedMs
+}
+
+func runSystemPing(ip string, timeout time.Duration) bool {
+	ok, _ := tryICMPPing(ip, timeout)
+	return ok
 }
 
 var macRegex = regexp.MustCompile(`(?i)([0-9a-f]{1,2}[:-]){5}([0-9a-f]{1,2})`)
