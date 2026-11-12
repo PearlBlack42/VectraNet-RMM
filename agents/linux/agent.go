@@ -84,6 +84,12 @@ type IngestResponse struct {
 	NextHeartbeatSec int    `json:"next_heartbeat_sec"`
 }
 
+type netDevSample struct {
+	rxBytes uint64
+	txBytes uint64
+	ts      time.Time
+}
+
 type LinuxAgentCollector struct {
 	serverURL        string
 	authToken        string
@@ -94,6 +100,7 @@ type LinuxAgentCollector struct {
 	lastCPUPct       float64
 	prevIdleTicks    uint64
 	prevTotalTicks   uint64
+	prevNetSamples   map[string]netDevSample
 	heartbeatCounter int
 	cachedSoftware   []SoftwareItem
 }
@@ -109,10 +116,11 @@ func NewLinuxAgentCollector(serverURL, authToken string, baseInterval time.Durat
 	}
 
 	return &LinuxAgentCollector{
-		serverURL:    strings.TrimRight(serverURL, "/"),
-		authToken:    authToken,
-		baseInterval: baseInterval,
-		workerSem:    make(chan struct{}, MaxWorkerGoroutines),
+		serverURL:      strings.TrimRight(serverURL, "/"),
+		authToken:      authToken,
+		baseInterval:   baseInterval,
+		workerSem:      make(chan struct{}, MaxWorkerGoroutines),
+		prevNetSamples: make(map[string]netDevSample),
 		gzipBufferPool: sync.Pool{
 			New: func() any {
 				return bytes.NewBuffer(make([]byte, 0, 8192))
@@ -130,6 +138,37 @@ func NewLinuxAgentCollector(serverURL, authToken string, baseInterval time.Durat
 	}
 }
 
+func readProcNetDevBytes() map[string][2]uint64 {
+	res := make(map[string][2]uint64)
+	f, err := os.Open("/proc/net/dev")
+	if err != nil {
+		return res
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		if lineNum <= 2 {
+			continue
+		}
+		line := strings.TrimSpace(scanner.Text())
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		ifName := strings.TrimSpace(parts[0])
+		fields := strings.Fields(parts[1])
+		if len(fields) >= 9 {
+			rxBytes, _ := strconv.ParseUint(fields[0], 10, 64)
+			txBytes, _ := strconv.ParseUint(fields[8], 10, 64)
+			res[ifName] = [2]uint64{rxBytes, txBytes}
+		}
+	}
+	return res
+}
+
 func (a *LinuxAgentCollector) collectNetworkInterfaces() ([]NetworkInterface, string, string) {
 	a.workerSem <- struct{}{}
 	defer func() { <-a.workerSem }()
@@ -138,6 +177,9 @@ func (a *LinuxAgentCollector) collectNetworkInterfaces() ([]NetworkInterface, st
 	if err != nil {
 		return nil, "127.0.0.1", "00:00:00:00:00:00"
 	}
+
+	netStats := readProcNetDevBytes()
+	now := time.Now()
 
 	var result []NetworkInterface
 	primaryIP := "127.0.0.1"
@@ -170,20 +212,61 @@ func (a *LinuxAgentCollector) collectNetworkInterfaces() ([]NetworkInterface, st
 				primaryIP = ipStr
 				primaryMAC = mac
 			}
+
+			var rxMbps, txMbps float64
+			if counters, ok := netStats[iface.Name]; ok {
+				if prev, hasPrev := a.prevNetSamples[iface.Name]; hasPrev {
+					elapsedSec := now.Sub(prev.ts).Seconds()
+					if elapsedSec > 0 && counters[0] >= prev.rxBytes && counters[1] >= prev.txBytes {
+						rxMbps = round2((float64(counters[0]-prev.rxBytes) * 8.0) / (elapsedSec * 1_000_000.0))
+						txMbps = round2((float64(counters[1]-prev.txBytes) * 8.0) / (elapsedSec * 1_000_000.0))
+					}
+				}
+				a.prevNetSamples[iface.Name] = netDevSample{
+					rxBytes: counters[0],
+					txBytes: counters[1],
+					ts:      now,
+				}
+			}
+
 			result = append(result, NetworkInterface{
 				Name:       iface.Name,
 				IPAddress:  ipStr,
 				MACAddress: mac,
 				SpeedMbps:  1000,
 				VLANID:     1,
-				RxMbps:     0.0,
-				TxMbps:     0.0,
+				RxMbps:     rxMbps,
+				TxMbps:     txMbps,
 				IsPrimary:  isPrimary,
 			})
 			break
 		}
 	}
 	return result, primaryIP, primaryMAC
+}
+
+func readProcStatTicks() (totalTicks, idleTicks uint64, ok bool) {
+	f, err := os.Open("/proc/stat")
+	if err != nil {
+		return 0, 0, false
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	if scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) >= 5 && fields[0] == "cpu" {
+			for i := 1; i < len(fields); i++ {
+				val, _ := strconv.ParseUint(fields[i], 10, 64)
+				totalTicks += val
+				if i == 4 || i == 5 { // idle + iowait
+					idleTicks += val
+				}
+			}
+			return totalTicks, idleTicks, totalTicks > 0
+		}
+	}
+	return 0, 0, false
 }
 
 func (a *LinuxAgentCollector) readLinuxMetrics(ctx context.Context) (osFamily, osVersion, cpuModel string, cpuPct, ramTotalGB, ramUsedGB, diskTotalGB, diskUsedGB float64) {
@@ -210,9 +293,9 @@ func (a *LinuxAgentCollector) readLinuxMetrics(ctx context.Context) (osFamily, o
 		scanner := bufio.NewScanner(f)
 		for scanner.Scan() {
 			line := scanner.Text()
-			if strings.HasPrefix(line, "model name") {
+			if strings.HasPrefix(line, "model name") || strings.HasPrefix(line, "Model") {
 				parts := strings.SplitN(line, ":", 2)
-				if len(parts) == 2 {
+				if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
 					cpuModel = strings.TrimSpace(parts[1])
 					break
 				}
@@ -221,52 +304,74 @@ func (a *LinuxAgentCollector) readLinuxMetrics(ctx context.Context) (osFamily, o
 		_ = f.Close()
 	}
 
-	if f, err := os.Open("/proc/stat"); err == nil {
-		scanner := bufio.NewScanner(f)
-		if scanner.Scan() {
-			fields := strings.Fields(scanner.Text())
-			if len(fields) >= 5 && fields[0] == "cpu" {
-				var totalTicks, idleTicks uint64
-				for i := 1; i < len(fields); i++ {
-					val, _ := strconv.ParseUint(fields[i], 10, 64)
-					totalTicks += val
-					if i == 4 || i == 5 {
-						idleTicks += val
+	// Real-time CPU Usage Calculation via /proc/stat delta.
+	// On the first sample (prevTotalTicks == 0), take two readings 160ms apart so the very first heartbeat reports real CPU load (never 0%).
+	if a.prevTotalTicks == 0 {
+		if t1, i1, ok := readProcStatTicks(); ok {
+			a.prevTotalTicks = t1
+			a.prevIdleTicks = i1
+			time.Sleep(160 * time.Millisecond)
+		}
+	}
+	if totalTicks, idleTicks, ok := readProcStatTicks(); ok {
+		if a.prevTotalTicks > 0 && totalTicks > a.prevTotalTicks {
+			deltaTotal := float64(totalTicks - a.prevTotalTicks)
+			deltaIdle := float64(idleTicks - a.prevIdleTicks)
+			cpuPct = math.Max(0.1, math.Min(100.0, (1.0-(deltaIdle/deltaTotal))*100.0))
+		}
+		a.prevTotalTicks = totalTicks
+		a.prevIdleTicks = idleTicks
+	}
+
+	// Fallback to /proc/loadavg if /proc/stat delta was 0
+	if cpuPct <= 0 {
+		if data, err := os.ReadFile("/proc/loadavg"); err == nil {
+			fields := strings.Fields(string(data))
+			if len(fields) >= 1 {
+				if load1, err := strconv.ParseFloat(fields[0], 64); err == nil && load1 > 0 {
+					cores := float64(runtime.NumCPU())
+					if cores < 1 {
+						cores = 1
 					}
+					cpuPct = math.Min(100.0, math.Max(0.5, (load1/cores)*100.0))
 				}
-				if a.prevTotalTicks > 0 && totalTicks > a.prevTotalTicks {
-					deltaTotal := float64(totalTicks - a.prevTotalTicks)
-					deltaIdle := float64(idleTicks - a.prevIdleTicks)
-					cpuPct = math.Max(0, math.Min(100, (1.0-(deltaIdle/deltaTotal))*100.0))
-				}
-				a.prevTotalTicks = totalTicks
-				a.prevIdleTicks = idleTicks
 			}
 		}
-		_ = f.Close()
 	}
 
 	if f, err := os.Open("/proc/meminfo"); err == nil {
-		var memTotalKB, memAvailableKB uint64
+		var memTotalKB, memAvailableKB, memFreeKB, buffersKB, cachedKB uint64
 		scanner := bufio.NewScanner(f)
 		for scanner.Scan() {
 			line := scanner.Text()
-			if strings.HasPrefix(line, "MemTotal:") {
-				fields := strings.Fields(line)
-				if len(fields) >= 2 {
-					memTotalKB, _ = strconv.ParseUint(fields[1], 10, 64)
-				}
-			} else if strings.HasPrefix(line, "MemAvailable:") {
-				fields := strings.Fields(line)
-				if len(fields) >= 2 {
-					memAvailableKB, _ = strconv.ParseUint(fields[1], 10, 64)
-				}
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				continue
+			}
+			val, _ := strconv.ParseUint(fields[1], 10, 64)
+			switch fields[0] {
+			case "MemTotal:":
+				memTotalKB = val
+			case "MemAvailable:":
+				memAvailableKB = val
+			case "MemFree:":
+				memFreeKB = val
+			case "Buffers:":
+				buffersKB = val
+			case "Cached:":
+				cachedKB = val
 			}
 		}
 		_ = f.Close()
 		if memTotalKB > 0 {
+			avail := memAvailableKB
+			if avail == 0 {
+				avail = memFreeKB + buffersKB + cachedKB
+			}
 			ramTotalGB = float64(memTotalKB) / (1024.0 * 1024.0)
-			ramUsedGB = float64(memTotalKB-memAvailableKB) / (1024.0 * 1024.0)
+			if memTotalKB > avail {
+				ramUsedGB = float64(memTotalKB-avail) / (1024.0 * 1024.0)
+			}
 		}
 	}
 

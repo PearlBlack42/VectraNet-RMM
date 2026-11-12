@@ -46,14 +46,34 @@ test('calculateAdaptiveHeartbeat adjusts interval based on CPU/RAM load and spik
   assert.equal(burst.nextIntervalSec, 10);
 });
 
-test('encryptCredentialSecret and validateCredentialForm enforce security inputs', () => {
+test('encryptCredentialSecret and validateCredentialForm enforce security inputs and allow short local passwords', () => {
   const bad = validateCredentialForm({
     label: 'A',
     username: 'admin',
-    rawSecret: '123456',
+    rawSecret: '123',
     scopeSubnet: '10.24.10.0/24',
   });
   assert.equal(bad.valid, false);
+
+  // Short 3-character password (e.g. local PC password) must pass without error
+  const shortLocalPass = validateCredentialForm({
+    label: 'PC Lokal Windows',
+    username: 'UserPC',
+    rawSecret: 'abc',
+    scopeSubnet: '192.168.1.0/24',
+  });
+  assert.equal(shortLocalPass.valid, true);
+
+  const encryptedShort = encryptCredentialSecret({
+    label: 'PC Lokal Windows',
+    protocol: 'WinRM-HTTPS',
+    username: 'UserPC',
+    rawSecret: 'abc',
+    port: 5986,
+    scopeSubnet: '192.168.1.0/24',
+  });
+  assert.ok(encryptedShort.cipherPreview.startsWith('aes256gcm$'));
+  assert.ok(encryptedShort.keyFingerprint.startsWith('SHA256:'));
 
   const good = validateCredentialForm({
     label: 'Prod WinRM Domain Admin',

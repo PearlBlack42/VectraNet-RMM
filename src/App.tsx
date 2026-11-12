@@ -17,6 +17,7 @@ import {
   ShieldCheck,
   RefreshCw,
   PlusCircle,
+  Trash2,
 } from 'lucide-react';
 import {
   AdminUserEntry,
@@ -338,57 +339,91 @@ export default function App() {
   };
 
   const handleEmitTestIngest = async () => {
-    const idx = devices.length + 1;
-    const hostSuffix = String(idx).padStart(2, '0');
-    const macByte = (16 + idx).toString(16).toUpperCase().padStart(2, '0');
-    const samplePayload = {
-      agent_version: 'v2.4.1-go',
-      hostname: `LOCAL-AGENT-NODE${hostSuffix}`,
-      ip_address: `10.24.10.${20 + idx}`,
-      mac_address: `00:25:90:FD:11:${macByte}`,
-      os_family: idx % 2 === 0 ? 'Windows Server' : 'Ubuntu Linux',
-      os_version: idx % 2 === 0 ? '2022 Datacenter' : '24.04.1 LTS',
-      kernel_arch: 'x86_64',
-      cpu_model: 'AMD EPYC 7763 64-Core',
-      cpu_cores: 16,
-      cpu_usage_pct: 24.5,
-      ram_total_gb: 64,
-      ram_used_gb: 21.8,
-      disk_total_gb: 1000,
-      disk_used_gb: 312.4,
-      agent_rss_mb: 11.6,
-      heartbeat_mode: 'standard',
-      interfaces: [
-        {
-          interface_name: 'eth0',
-          ip_address: `10.24.10.${20 + idx}`,
-          mac_address: `00:25:90:FD:11:${macByte}`,
-          speed_mbps: 10000,
-          vlan_id: 10,
-          rx_mbps: 142.8,
-          tx_mbps: 98.4,
-          is_primary: true,
-        },
-      ],
-      software: [
-        {
-          software_name: 'VectraNet Native Go Agent',
-          version: '2.4.1',
-          publisher: 'VectraNet SecOps',
-          install_date: new Date().toISOString().slice(0, 10),
-        },
-      ],
-    };
-
+    setScanError(null);
     try {
-      await fetch(`${API_BASE}/api/v1/agent/ingest`, {
+      // Collect real live OS hardware telemetry (CPU %, RAM Used/Total GB, Disk GB, CPU Model & Cores)
+      const res = await fetch(`${API_BASE}/api/v1/agent/collect-local`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(samplePayload),
+        body: JSON.stringify({ trigger: 'manual-local-hardware-ingest' }),
       });
+
+      if (res.ok) {
+        const data = (await res.json().catch(() => ({}))) as {
+          hardware?: {
+            cpuModel?: string;
+            cpuCores?: number;
+            cpuUsagePct?: number;
+            ramUsedGb?: number;
+            ramTotalGb?: number;
+          };
+        };
+        if (data.hardware) {
+          setScanMessage(
+            lang === 'id'
+              ? `Telemetri hardware asli berhasil dikirim: ${data.hardware.cpuModel || 'CPU'} (${data.hardware.cpuCores || 1} Core) · CPU ${data.hardware.cpuUsagePct}% · RAM ${data.hardware.ramUsedGb}/${data.hardware.ramTotalGb} GB.`
+              : `Real hardware telemetry ingested: ${data.hardware.cpuModel || 'CPU'} (${data.hardware.cpuCores || 1} Cores) · CPU ${data.hardware.cpuUsagePct}% · RAM ${data.hardware.ramUsedGb}/${data.hardware.ramTotalGb} GB.`
+          );
+        }
+      }
       await fetchLiveTelemetry();
     } catch {
       // Ignore network error
+    }
+  };
+
+  const handleClearDatabase = async () => {
+    const confirmPrompt =
+      lang === 'id'
+        ? 'Apakah Anda yakin ingin menghapus seluruh data inventaris perangkat, interface jaringan, dan log sistem dari database PostgreSQL (vectranet_rmm)?'
+        : 'Are you sure you want to delete all device inventory, network interfaces, and system logs from PostgreSQL (vectranet_rmm)?';
+
+    let confirmed = true;
+    try {
+      if (typeof window !== 'undefined' && typeof window.confirm === 'function') {
+        confirmed = window.confirm(confirmPrompt);
+      }
+    } catch {
+      confirmed = true;
+    }
+
+    if (!confirmed) {
+      return;
+    }
+
+    setScanError(null);
+    setScanMessage(null);
+
+    try {
+      let res = await fetch(`${API_BASE}/api/v1/devices/clear`, {
+        method: 'DELETE',
+      });
+      if (!res.ok) {
+        res = await fetch(`${API_BASE}/api/v1/devices/clear`, {
+          method: 'POST',
+        });
+      }
+
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        setScanError(errBody.error || 'Gagal mengosongkan database PostgreSQL');
+        return;
+      }
+
+      // Immediately reset local state to 0 devices and refresh from backend
+      setDevices([]);
+      setLogs([]);
+      setSelectedDeviceIds([]);
+      setInspectDevice(null);
+      setScanProgress(null);
+      setScanMessage(
+        lang === 'id'
+          ? '🧹 Database PostgreSQL (vectranet_rmm) berhasil dikosongkan. Tabel inventaris kembali ke 0 perangkat.'
+          : '🧹 PostgreSQL database (vectranet_rmm) cleared. Inventory reset to 0 devices.'
+      );
+      await fetchLiveTelemetry();
+    } catch (err) {
+      setScanError(`Gagal menghubungi endpoint /api/v1/devices/clear: ${(err as Error).message}`);
     }
   };
 
@@ -813,6 +848,15 @@ export default function App() {
                         <PlusCircle className="w-4 h-4" />
                         {lang === 'id' ? 'Uji Ingest Agen Lokal' : 'Test Local Agent Ingest'}
                       </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleClearDatabase()}
+                        disabled={isScanning}
+                        className="px-4 py-2 text-xs font-semibold bg-rose-500/15 hover:bg-rose-500/25 disabled:opacity-50 text-rose-300 border border-rose-500/40 rounded-lg transition-colors flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer"
+                      >
+                        <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+                        <span>🧹 Clear Database / Reset Inventaris</span>
+                      </button>
                     </div>
                   </div>
                 </form>
@@ -1138,6 +1182,7 @@ export default function App() {
               users={adminUsers}
               config={engineConfig}
               lang={lang}
+              deviceCount={devices.length}
               onAddUser={(u) => setAdminUsers((prev) => [u, ...prev])}
               onToggleUserStatus={(id) =>
                 setAdminUsers((prev) =>
@@ -1152,6 +1197,7 @@ export default function App() {
                 )
               }
               onUpdateConfig={setEngineConfig}
+              onClearDatabase={() => void handleClearDatabase()}
             />
           )}
 

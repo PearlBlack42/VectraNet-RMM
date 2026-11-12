@@ -136,16 +136,21 @@ export function validateCredentialForm(input: {
   rawSecret: string;
   scopeSubnet: string;
 }): { valid: boolean; error?: string } {
-  if (!input.label || input.label.trim().length < 3) {
-    return { valid: false, error: 'Label must be at least 3 characters' };
+  if (!input.label || input.label.trim().length < 2) {
+    return { valid: false, error: 'Label profil kredensial wajib diisi (minimal 2 karakter)' };
   }
-  if (!input.username || input.username.trim().length < 2) {
-    return { valid: false, error: 'Username or Principal is required' };
+  if (!input.username || input.username.trim().length < 1) {
+    return { valid: false, error: 'Username atau Principal wajib diisi' };
   }
-  if (!input.rawSecret || input.rawSecret.trim().length < 6) {
-    return { valid: false, error: 'Secret/Password/Key must be at least 6 characters' };
+  // Allow short passwords (1+ chars, e.g. 3-letter local PC passwords) or empty passwordless keys
+  if (typeof input.rawSecret !== 'string') {
+    return { valid: false, error: 'Format Secret/Password tidak valid' };
   }
-  const cidrCheck = parseCidrRange(input.scopeSubnet);
+  const normalizedSubnet =
+    input.scopeSubnet.trim() && !input.scopeSubnet.includes('/')
+      ? `${input.scopeSubnet.trim()}/32`
+      : input.scopeSubnet.trim();
+  const cidrCheck = parseCidrRange(normalizedSubnet);
   if (!cidrCheck.valid) {
     return { valid: false, error: cidrCheck.error || 'Invalid CIDR subnet scope' };
   }

@@ -25,6 +25,7 @@ import (
 	"os/signal"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -190,53 +191,97 @@ func (a *WindowsAgentCollector) readWindowsMetrics(ctx context.Context) (osFamil
 	osVersion = "Windows NT"
 	cpuModel = "x86_64 Processor"
 
-	cmdCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	cmdCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
 	defer cancel()
 
+	// Collect real Windows hardware telemetry using Win32_OperatingSystem, Win32_Processor,
+	// Win32_PerfFormattedData_PerfOS_Processor, and Win32_LogicalDisk
 	psScript := `
+$ErrorActionPreference = 'SilentlyContinue'
 $os = Get-CimInstance Win32_OperatingSystem -Property Caption,TotalVisibleMemorySize,FreePhysicalMemory
-$cpu = Get-CimInstance Win32_Processor -Property Name,LoadPercentage | Select-Object -First 1
+$cpus = @(Get-CimInstance Win32_Processor -Property Name,LoadPercentage)
+$perfCpu = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'" -Property PercentProcessorTime
 $disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'" -Property Size,FreeSpace
+$cpuLoadVal = 0
+if ($perfCpu -and $null -ne $perfCpu.PercentProcessorTime) {
+  $cpuLoadVal = [double]$perfCpu.PercentProcessorTime
+} elseif ($cpus.Count -gt 0) {
+  $measure = ($cpus | Measure-Object -Property LoadPercentage -Average)
+  if ($null -ne $measure.Average) { $cpuLoadVal = [double]$measure.Average }
+}
 [PSCustomObject]@{
-  OSCaption = $os.Caption
-  MemTotalKB = $os.TotalVisibleMemorySize
-  MemFreeKB = $os.FreePhysicalMemory
-  CPUName = $cpu.Name
-  CPULoad = $cpu.LoadPercentage
-  DiskSizeB = $disk.Size
-  DiskFreeB = $disk.FreeSpace
+  OSCaption  = [string]$os.Caption
+  MemTotalKB = [double]$os.TotalVisibleMemorySize
+  MemFreeKB  = [double]$os.FreePhysicalMemory
+  CPUName    = [string]$cpus[0].Name
+  CPULoad    = [double]$cpuLoadVal
+  DiskSizeB  = [double]$disk.Size
+  DiskFreeB  = [double]$disk.FreeSpace
 } | ConvertTo-Json -Compress
 `
 	out, err := exec.CommandContext(cmdCtx, "powershell", "-NoProfile", "-NonInteractive", "-Command", psScript).Output()
-	if err != nil {
-		return
+	if err == nil && len(bytes.TrimSpace(out)) > 0 {
+		var winData struct {
+			OSCaption  string  `json:"OSCaption"`
+			MemTotalKB float64 `json:"MemTotalKB"`
+			MemFreeKB  float64 `json:"MemFreeKB"`
+			CPUName    string  `json:"CPUName"`
+			CPULoad    float64 `json:"CPULoad"`
+			DiskSizeB  float64 `json:"DiskSizeB"`
+			DiskFreeB  float64 `json:"DiskFreeB"`
+		}
+
+		if jsonErr := json.Unmarshal(bytes.TrimSpace(out), &winData); jsonErr == nil {
+			if winData.OSCaption != "" {
+				osVersion = strings.TrimSpace(winData.OSCaption)
+			}
+			if winData.CPUName != "" {
+				cpuModel = strings.TrimSpace(winData.CPUName)
+			}
+			cpuPct = math.Max(0.1, math.Min(100.0, winData.CPULoad))
+			if winData.MemTotalKB > 0 {
+				ramTotalGB = winData.MemTotalKB / (1024.0 * 1024.0)
+				ramUsedGB = math.Max(0.1, (winData.MemTotalKB-winData.MemFreeKB)/(1024.0*1024.0))
+			}
+			if winData.DiskSizeB > 0 {
+				diskTotalGB = winData.DiskSizeB / (1024.0 * 1024.0 * 1024.0)
+				diskUsedGB = math.Max(0.1, (winData.DiskSizeB-winData.DiskFreeB)/(1024.0*1024.0*1024.0))
+			}
+			if ramTotalGB > 0 {
+				return
+			}
+		}
 	}
 
-	var winData struct {
-		OSCaption  string  `json:"OSCaption"`
-		MemTotalKB float64 `json:"MemTotalKB"`
-		MemFreeKB  float64 `json:"MemFreeKB"`
-		CPUName    string  `json:"CPUName"`
-		CPULoad    float64 `json:"CPULoad"`
-		DiskSizeB  float64 `json:"DiskSizeB"`
-		DiskFreeB  float64 `json:"DiskFreeB"`
+	// Fallback to WMIC if PowerShell CIM is restricted
+	if wmicOut, wErr := exec.CommandContext(cmdCtx, "wmic", "os", "get", "Caption,TotalVisibleMemorySize,FreePhysicalMemory", "/value").Output(); wErr == nil {
+		var totalKB, freeKB float64
+		for _, line := range strings.Split(string(wmicOut), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "Caption=") {
+				osVersion = strings.TrimSpace(strings.TrimPrefix(line, "Caption="))
+			} else if strings.HasPrefix(line, "TotalVisibleMemorySize=") {
+				totalKB, _ = strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(line, "TotalVisibleMemorySize=")), 64)
+			} else if strings.HasPrefix(line, "FreePhysicalMemory=") {
+				freeKB, _ = strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(line, "FreePhysicalMemory=")), 64)
+			}
+		}
+		if totalKB > 0 {
+			ramTotalGB = totalKB / (1024.0 * 1024.0)
+			ramUsedGB = math.Max(0.1, (totalKB-freeKB)/(1024.0*1024.0))
+		}
 	}
 
-	if err := json.Unmarshal(out, &winData); err == nil {
-		if winData.OSCaption != "" {
-			osVersion = strings.TrimSpace(winData.OSCaption)
-		}
-		if winData.CPUName != "" {
-			cpuModel = strings.TrimSpace(winData.CPUName)
-		}
-		cpuPct = winData.CPULoad
-		if winData.MemTotalKB > 0 {
-			ramTotalGB = winData.MemTotalKB / (1024.0 * 1024.0)
-			ramUsedGB = (winData.MemTotalKB - winData.MemFreeKB) / (1024.0 * 1024.0)
-		}
-		if winData.DiskSizeB > 0 {
-			diskTotalGB = winData.DiskSizeB / (1024.0 * 1024.0 * 1024.0)
-			diskUsedGB = (winData.DiskSizeB - winData.DiskFreeB) / (1024.0 * 1024.0 * 1024.0)
+	if wmicCPU, cErr := exec.CommandContext(cmdCtx, "wmic", "cpu", "get", "Name,LoadPercentage", "/value").Output(); cErr == nil {
+		for _, line := range strings.Split(string(wmicCPU), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "Name=") {
+				cpuModel = strings.TrimSpace(strings.TrimPrefix(line, "Name="))
+			} else if strings.HasPrefix(line, "LoadPercentage=") {
+				if v, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(line, "LoadPercentage=")), 64); err == nil {
+					cpuPct = math.Max(0.1, v)
+				}
+			}
 		}
 	}
 	return

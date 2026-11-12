@@ -57,11 +57,16 @@ export const CredentialVaultView: React.FC<CredentialVaultViewProps> = ({
     setFormError(null);
     setBannerMessage(null);
 
+    const normalizedScope =
+      scopeSubnet.trim() && !scopeSubnet.includes('/')
+        ? `${scopeSubnet.trim()}/32`
+        : scopeSubnet.trim();
+
     const validation = validateCredentialForm({
       label,
       username,
       rawSecret,
-      scopeSubnet,
+      scopeSubnet: normalizedScope,
     });
 
     if (!validation.valid) {
@@ -75,7 +80,7 @@ export const CredentialVaultView: React.FC<CredentialVaultViewProps> = ({
       username,
       rawSecret,
       port,
-      scopeSubnet,
+      scopeSubnet: normalizedScope,
     });
 
     const newEntry: CredentialVaultEntry = {

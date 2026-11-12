@@ -5,6 +5,7 @@ import {
   UserPlus,
   CheckCircle2,
   Shield,
+  Trash2,
 } from 'lucide-react';
 import { AdminUserEntry, EngineConfigState } from '../types/network';
 
@@ -12,18 +13,22 @@ interface AdminConfigViewProps {
   users: AdminUserEntry[];
   config: EngineConfigState;
   lang: 'id' | 'en';
+  deviceCount?: number;
   onAddUser: (user: AdminUserEntry) => void;
   onToggleUserStatus: (id: string) => void;
   onUpdateConfig: (next: EngineConfigState) => void;
+  onClearDatabase?: () => void;
 }
 
 export const AdminConfigView: React.FC<AdminConfigViewProps> = ({
   users,
   config,
   lang,
+  deviceCount = 0,
   onAddUser,
   onToggleUserStatus,
   onUpdateConfig,
+  onClearDatabase,
 }) => {
   const [fullName, setFullName] = useState('');
   const [email, setEmail] = useState('');
@@ -185,147 +190,177 @@ export const AdminConfigView: React.FC<AdminConfigViewProps> = ({
         </div>
       </div>
 
-      {/* Core Engine & Agent Policy Configuration */}
-      <div className="xl:col-span-6 bg-[#161F30] border border-[#1E293B] rounded-xl p-6">
-        <div className="flex items-center gap-2.5 border-b border-[#1E293B] pb-4 mb-5">
-          <Sliders className="w-5 h-5 text-cyan-400" />
-          <div>
-            <h2 className="text-base font-semibold text-white">
-              {lang === 'id'
-                ? 'Konfigurasi Core Engine & Kebijakan Agen'
-                : 'Core Engine & Agent Resource Policy Configuration'}
-            </h2>
-            <p className="text-xs text-slate-400">
-              {lang === 'id'
-                ? 'Parameter disinkronkan langsung ke semua agen melalui respons ingest berikutnya.'
-                : 'Parameters sync automatically to connected agents on their next heartbeat frame.'}
-            </p>
+      {/* Core Engine & Agent Policy Configuration + Database Reset */}
+      <div className="xl:col-span-6 space-y-6">
+        <div className="bg-[#161F30] border border-[#1E293B] rounded-xl p-6">
+          <div className="flex items-center gap-2.5 border-b border-[#1E293B] pb-4 mb-5">
+            <Sliders className="w-5 h-5 text-cyan-400" />
+            <div>
+              <h2 className="text-base font-semibold text-white">
+                {lang === 'id'
+                  ? 'Konfigurasi Core Engine & Kebijakan Agen'
+                  : 'Core Engine & Agent Resource Policy Configuration'}
+              </h2>
+              <p className="text-xs text-slate-400">
+                {lang === 'id'
+                  ? 'Parameter disinkronkan langsung ke semua agen melalui respons ingest berikutnya.'
+                  : 'Parameters sync automatically to connected agents on their next heartbeat frame.'}
+              </p>
+            </div>
           </div>
+
+          <form onSubmit={handleSaveConfig} className="space-y-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label
+                  htmlFor="cfg-heartbeat"
+                  className="block text-xs font-medium text-slate-300 mb-1"
+                >
+                  Base Heartbeat Interval (detik)
+                </label>
+                <input
+                  id="cfg-heartbeat"
+                  type="number"
+                  value={draftConfig.baseHeartbeatSec}
+                  onChange={(e) =>
+                    setDraftConfig({ ...draftConfig, baseHeartbeatSec: Number(e.target.value) })
+                  }
+                  className="w-full px-3 py-2 text-sm font-mono tabular-nums bg-[#0B0F17] border border-[#1E293B] rounded-lg text-slate-100"
+                />
+              </div>
+
+              <div>
+                <label
+                  htmlFor="cfg-ramcap"
+                  className="block text-xs font-medium text-slate-300 mb-1"
+                >
+                  Batas Memori Agen / MemoryMax (MB)
+                </label>
+                <input
+                  id="cfg-ramcap"
+                  type="number"
+                  value={draftConfig.maxAgentRamMb}
+                  onChange={(e) =>
+                    setDraftConfig({ ...draftConfig, maxAgentRamMb: Number(e.target.value) })
+                  }
+                  className="w-full px-3 py-2 text-sm font-mono tabular-nums bg-[#0B0F17] border border-[#1E293B] rounded-lg text-slate-100"
+                />
+              </div>
+
+              <div>
+                <label
+                  htmlFor="cfg-goroutines"
+                  className="block text-xs font-medium text-slate-300 mb-1"
+                >
+                  Maksimal Goroutine IP Sweeper
+                </label>
+                <input
+                  id="cfg-goroutines"
+                  type="number"
+                  value={draftConfig.maxScannerGoroutines}
+                  onChange={(e) =>
+                    setDraftConfig({
+                      ...draftConfig,
+                      maxScannerGoroutines: Number(e.target.value),
+                    })
+                  }
+                  className="w-full px-3 py-2 text-sm font-mono tabular-nums bg-[#0B0F17] border border-[#1E293B] rounded-lg text-slate-100"
+                />
+              </div>
+
+              <div>
+                <label
+                  htmlFor="cfg-retention"
+                  className="block text-xs font-medium text-slate-300 mb-1"
+                >
+                  Retensi Hypertable TimescaleDB (Hari)
+                </label>
+                <input
+                  id="cfg-retention"
+                  type="number"
+                  value={draftConfig.timescaleRetentionDays}
+                  onChange={(e) =>
+                    setDraftConfig({
+                      ...draftConfig,
+                      timescaleRetentionDays: Number(e.target.value),
+                    })
+                  }
+                  className="w-full px-3 py-2 text-sm font-mono tabular-nums bg-[#0B0F17] border border-[#1E293B] rounded-lg text-slate-100"
+                />
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between p-3.5 rounded-lg bg-[#0B0F17] border border-[#1E293B]">
+              <div>
+                <div className="text-xs font-medium text-slate-200">
+                  Auto-Push Deployment pada Subnet Baru
+                </div>
+                <div className="text-[11px] text-slate-400">
+                  Deploy agen otomatis jika host baru merespons WinRM (5986) atau SSH (22)
+                </div>
+              </div>
+              <input
+                id="cfg-autopush"
+                aria-label="Auto-Push Deployment pada Subnet Baru"
+                type="checkbox"
+                checked={draftConfig.autoPushNewSubnets}
+                onChange={(e) =>
+                  setDraftConfig({ ...draftConfig, autoPushNewSubnets: e.target.checked })
+                }
+                className="w-4 h-4 accent-emerald-500 cursor-pointer"
+              />
+            </div>
+
+            {configSaved && (
+              <div className="p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-xs text-emerald-300 flex items-center gap-2">
+                <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                <span>
+                  {lang === 'id'
+                    ? 'Konfigurasi berhasil disimpan dan dipublikasikan ke agen aktif.'
+                    : 'Configuration saved and broadcast to active agents.'}
+                </span>
+              </div>
+            )}
+
+            <button
+              type="submit"
+              className="w-full py-2.5 px-4 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold text-xs rounded-lg transition-colors flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <Shield className="w-4 h-4" />
+              {lang === 'id'
+                ? 'Terapkan Kebijakan Engine & Agen'
+                : 'Apply Engine & Agent Policy'}
+            </button>
+          </form>
         </div>
 
-        <form onSubmit={handleSaveConfig} className="space-y-4">
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div>
-              <label
-                htmlFor="cfg-heartbeat"
-                className="block text-xs font-medium text-slate-300 mb-1"
+        {/* Database Maintenance / Reset Inventory Section */}
+        {onClearDatabase && (
+          <div className="bg-[#161F30] border border-rose-500/30 rounded-xl p-6 space-y-4">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-semibold text-rose-400 flex items-center gap-2">
+                  <Trash2 className="w-4 h-4" />
+                  {lang === 'id'
+                    ? 'Pemeliharaan Database PostgreSQL (vectranet_rmm)'
+                    : 'PostgreSQL Database Maintenance (vectranet_rmm)'}
+                </h3>
+                <p className="text-xs text-slate-400 mt-1">
+                  {lang === 'id'
+                    ? `Kosongkan seluruh tabel devices, network_interfaces, telemetry_logs, dan system_logs (${deviceCount} perangkat saat ini).`
+                    : `Wipe all records from devices, network_interfaces, telemetry_logs, and system_logs (${deviceCount} current devices).`}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={onClearDatabase}
+                className="px-4 py-2 text-xs font-semibold bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 border border-rose-500/40 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
               >
-                Base Heartbeat Interval (detik)
-              </label>
-              <input
-                id="cfg-heartbeat"
-                type="number"
-                value={draftConfig.baseHeartbeatSec}
-                onChange={(e) =>
-                  setDraftConfig({ ...draftConfig, baseHeartbeatSec: Number(e.target.value) })
-                }
-                className="w-full px-3 py-2 text-sm font-mono tabular-nums bg-[#0B0F17] border border-[#1E293B] rounded-lg text-slate-100"
-              />
-            </div>
-
-            <div>
-              <label
-                htmlFor="cfg-ramcap"
-                className="block text-xs font-medium text-slate-300 mb-1"
-              >
-                Batas Memori Agen / MemoryMax (MB)
-              </label>
-              <input
-                id="cfg-ramcap"
-                type="number"
-                value={draftConfig.maxAgentRamMb}
-                onChange={(e) =>
-                  setDraftConfig({ ...draftConfig, maxAgentRamMb: Number(e.target.value) })
-                }
-                className="w-full px-3 py-2 text-sm font-mono tabular-nums bg-[#0B0F17] border border-[#1E293B] rounded-lg text-slate-100"
-              />
-            </div>
-
-            <div>
-              <label
-                htmlFor="cfg-goroutines"
-                className="block text-xs font-medium text-slate-300 mb-1"
-              >
-                Maksimal Goroutine IP Sweeper
-              </label>
-              <input
-                id="cfg-goroutines"
-                type="number"
-                value={draftConfig.maxScannerGoroutines}
-                onChange={(e) =>
-                  setDraftConfig({
-                    ...draftConfig,
-                    maxScannerGoroutines: Number(e.target.value),
-                  })
-                }
-                className="w-full px-3 py-2 text-sm font-mono tabular-nums bg-[#0B0F17] border border-[#1E293B] rounded-lg text-slate-100"
-              />
-            </div>
-
-            <div>
-              <label
-                htmlFor="cfg-retention"
-                className="block text-xs font-medium text-slate-300 mb-1"
-              >
-                Retensi Hypertable TimescaleDB (Hari)
-              </label>
-              <input
-                id="cfg-retention"
-                type="number"
-                value={draftConfig.timescaleRetentionDays}
-                onChange={(e) =>
-                  setDraftConfig({
-                    ...draftConfig,
-                    timescaleRetentionDays: Number(e.target.value),
-                  })
-                }
-                className="w-full px-3 py-2 text-sm font-mono tabular-nums bg-[#0B0F17] border border-[#1E293B] rounded-lg text-slate-100"
-              />
+                🧹 Clear Database / Reset Inventaris
+              </button>
             </div>
           </div>
-
-          <div className="flex items-center justify-between p-3.5 rounded-lg bg-[#0B0F17] border border-[#1E293B]">
-            <div>
-              <div className="text-xs font-medium text-slate-200">
-                Auto-Push Deployment pada Subnet Baru
-              </div>
-              <div className="text-[11px] text-slate-400">
-                Deploy agen otomatis jika host baru merespons WinRM (5986) atau SSH (22)
-              </div>
-            </div>
-            <input
-              id="cfg-autopush"
-              aria-label="Auto-Push Deployment pada Subnet Baru"
-              type="checkbox"
-              checked={draftConfig.autoPushNewSubnets}
-              onChange={(e) =>
-                setDraftConfig({ ...draftConfig, autoPushNewSubnets: e.target.checked })
-              }
-              className="w-4 h-4 accent-emerald-500 cursor-pointer"
-            />
-          </div>
-
-          {configSaved && (
-            <div className="p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-xs text-emerald-300 flex items-center gap-2">
-              <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-              <span>
-                {lang === 'id'
-                  ? 'Konfigurasi berhasil disimpan dan dipublikasikan ke agen aktif.'
-                  : 'Configuration saved and broadcast to active agents.'}
-              </span>
-            </div>
-          )}
-
-          <button
-            type="submit"
-            className="w-full py-2.5 px-4 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold text-xs rounded-lg transition-colors flex items-center justify-center gap-2 cursor-pointer"
-          >
-            <Shield className="w-4 h-4" />
-            {lang === 'id'
-              ? 'Terapkan Kebijakan Engine & Agen'
-              : 'Apply Engine & Agent Policy'}
-          </button>
-        </form>
+        )}
       </div>
     </div>
   );
