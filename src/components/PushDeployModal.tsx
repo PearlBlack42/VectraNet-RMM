@@ -8,6 +8,10 @@ import {
   Terminal,
   ShieldCheck,
   RefreshCw,
+  Copy,
+  Check,
+  Wrench,
+  Radar,
 } from 'lucide-react';
 import {
   CredentialVaultEntry,
@@ -28,6 +32,8 @@ interface PushDeployModalProps {
   ) => Promise<DeployExecutionResult>;
 }
 
+const DEFAULT_POWERSHELL_REMEDIATION = `Enable-PSRemoting -Force; Set-Item WSMan:\\localhost\\Client\\TrustedHosts -Value '*' -Force; reg add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System /v LocalAccountTokenFilterPolicy /t REG_DWORD /d 1 /f; New-NetFirewallRule -DisplayName "VectraNet-WinRM-HTTP" -Direction Inbound -LocalPort 5985 -Protocol TCP -Action Allow`;
+
 export const PushDeployModal: React.FC<PushDeployModalProps> = ({
   isOpen,
   targetDevices,
@@ -44,6 +50,7 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
   const [deployFailed, setDeployFailed] = useState(false);
   const [deployErrorText, setDeployErrorText] = useState<string | null>(null);
   const [stepLogs, setStepLogs] = useState<string[]>([]);
+  const [copiedPsCmd, setCopiedPsCmd] = useState(false);
 
   // Reset modal execution state ONLY when modal opens or target device list changes
   const targetKey = targetDevices.map((d) => `${d.id}:${d.ipAddress}`).join(',');
@@ -54,6 +61,7 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
       setDeployFailed(false);
       setDeployErrorText(null);
       setStepLogs([]);
+      setCopiedPsCmd(false);
     }
   }, [isOpen, targetKey]);
 
@@ -71,6 +79,16 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
 
   const selectedCred =
     credentials.find((c) => c.id === selectedCredentialId) || credentials[0] || null;
+
+  const handleCopyPowerShell = async (cmdText: string) => {
+    try {
+      await navigator.clipboard.writeText(cmdText);
+      setCopiedPsCmd(true);
+      setTimeout(() => setCopiedPsCmd(false), 2500);
+    } catch {
+      setCopiedPsCmd(false);
+    }
+  };
 
   const handleRunPush = async () => {
     if (!selectedCred) {
@@ -100,7 +118,8 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
     setStepLogs([
       `[00.1s] Mengirim instruksi Push Deployment ke backend (/api/v1/deploy)...`,
       `[00.1s] Target Dinamis: ${targetListStr}`,
-      `[00.1s] Kredensial Terpilih: "${selectedCred.label}" [User: ${selectedCred.username} | Proto: ${selectedCred.protocol} | Port: ${selectedCred.port}]`,
+      `[00.1s] Kredensial Terpilih: "${selectedCred.label}" [User: ${selectedCred.username} | Proto: ${selectedCred.protocol} | Port Awal: ${selectedCred.port}]`,
+      `[00.2s] [SMART-PROBE] Memindai port manajemen aktif secara paralel (5985/WinRM-HTTP, 5986/WinRM-HTTPS, 135/DCOM-RPC, 445/SMB-IPC$, 22/SSH)...`,
     ]);
 
     try {
@@ -147,25 +166,25 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 overflow-y-auto"
       role="dialog"
       aria-modal="true"
       aria-labelledby="push-deploy-title"
     >
-      <div className="w-full max-w-2xl bg-[#161F30] border border-[#1E293B] rounded-xl p-6 space-y-5 shadow-2xl">
+      <div className="w-full max-w-2xl bg-[#161F30] border border-[#1E293B] rounded-xl p-6 space-y-4 shadow-2xl my-auto max-h-[92vh] overflow-y-auto">
         <div className="flex items-start justify-between gap-4 border-b border-[#1E293B] pb-4">
           <div className="flex items-center gap-2.5">
             <Rocket className="w-5 h-5 text-emerald-400" />
             <div>
               <h2 id="push-deploy-title" className="text-base font-semibold text-white">
                 {lang === 'id'
-                  ? 'Remote Agent Push Deployment Engine (WinRM / SSH)'
-                  : 'Remote Agent Push Deployment Engine (WinRM / SSH)'}
+                  ? 'Smart Multi-Protocol Push Deployment (Auto-Fallback)'
+                  : 'Smart Multi-Protocol Push Deployment (Auto-Fallback)'}
               </h2>
               <p className="text-xs text-slate-400">
                 {lang === 'id'
-                  ? 'Dekripsi kredensial AES-256-GCM & eksekusi koneksi nyata ke IP target.'
-                  : 'Real AES-256-GCM credential decryption & live connection to target IP.'}
+                  ? 'Deteksi otomatis port terbuka (5985 WinRM-HTTP, 5986 HTTPS, 135 WMI/CIM, 445 SMB, 22 SSH) & dekripsi AES-256-GCM.'
+                  : 'Auto-detects open management ports (5985 WinRM-HTTP, 5986 HTTPS, 135 WMI/CIM, 445 SMB, 22 SSH) & AES-256-GCM unseal.'}
               </p>
             </div>
           </div>
@@ -182,12 +201,18 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
 
         {/* Target Devices Summary (Dynamic from UI Row Selection) */}
         <div>
-          <div className="text-xs font-medium text-slate-300 mb-2">
-            {lang === 'id'
-              ? `Target Perangkat Dinamis (${targetDevices.length} Host):`
-              : `Dynamic Target Endpoints (${targetDevices.length} Hosts):`}
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-xs font-medium text-slate-300">
+              {lang === 'id'
+                ? `Target Perangkat Dinamis (${targetDevices.length} Host):`
+                : `Dynamic Target Endpoints (${targetDevices.length} Hosts):`}
+            </span>
+            <span className="inline-flex items-center gap-1 text-[11px] font-mono text-cyan-300 bg-cyan-500/10 px-2 py-0.5 rounded border border-cyan-500/20">
+              <Radar className="w-3 h-3" />
+              Auto-Fallback: 5985 → 5986 → 135 → 445 → 22
+            </span>
           </div>
-          <div className="max-h-32 overflow-y-auto space-y-1.5 p-2.5 rounded-lg bg-[#0B0F17] border border-[#1E293B]">
+          <div className="max-h-28 overflow-y-auto space-y-1.5 p-2.5 rounded-lg bg-[#0B0F17] border border-[#1E293B]">
             {targetDevices.map((dev) => (
               <div
                 key={dev.id}
@@ -199,10 +224,8 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
                 <span className="text-slate-400">
                   {dev.os} ·{' '}
                   {selectedCred
-                    ? `${selectedCred.protocol} (Port ${selectedCred.port})`
-                    : dev.os.toLowerCase().includes('windows')
-                    ? 'WinRM (5985/5986)'
-                    : 'SSH (22)'}
+                    ? `Preferensi: ${selectedCred.protocol} (${selectedCred.port}) + Auto-Probe`
+                    : 'Auto-Detect (5985/5986/135/445/22)'}
                 </span>
               </div>
             ))}
@@ -241,8 +264,8 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
             >
               {credentials.map((cred) => (
                 <option key={cred.id} value={cred.id}>
-                  {cred.label} — [{cred.protocol} | User: {cred.username} | Port: {cred.port} |{' '}
-                  {cred.keyFingerprint}]
+                  {cred.label} — [{cred.protocol} | User: {cred.username} | Port Awal: {cred.port}{' '}
+                  | {cred.keyFingerprint}]
                 </option>
               ))}
             </select>
@@ -257,8 +280,8 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
                 <Terminal className="w-3.5 h-3.5" />
                 <span>
                   {lang === 'id'
-                    ? 'Log Eksekusi Remote Deployment Nyata'
-                    : 'Live Remote Deployment Execution Log'}
+                    ? 'Log Eksekusi Remote Deployment & Smart Port Probing'
+                    : 'Live Remote Deployment & Smart Port Probe Log'}
                 </span>
               </span>
               {selectedCred && (
@@ -268,10 +291,13 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
                 </span>
               )}
             </div>
-            <div className="p-3.5 rounded-lg bg-[#0B0F17] border border-[#1E293B] font-mono text-[11px] space-y-1.5 max-h-52 overflow-y-auto">
+            <div className="p-3.5 rounded-lg bg-[#0B0F17] border border-[#1E293B] font-mono text-[11px] space-y-1.5 max-h-48 overflow-y-auto">
               {stepLogs.map((line, idx) => {
                 const isErr = line.includes('[ERROR]');
-                const isOk = line.includes('[OK]');
+                const isOk = line.includes('[OK]') || line.includes('[SUCCESS]');
+                const isProbe = line.includes('[SMART-PROBE]');
+                const isFallback = line.includes('[AUTO-FALLBACK]');
+                const isRemediation = line.includes('[REMEDIATION-POWERSHELL]');
                 return (
                   <div
                     key={idx}
@@ -279,7 +305,13 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
                       isErr
                         ? 'text-rose-400 font-medium'
                         : isOk
-                        ? 'text-emerald-400'
+                        ? 'text-emerald-400 font-medium'
+                        : isFallback
+                        ? 'text-amber-300 font-medium'
+                        : isRemediation
+                        ? 'text-amber-200 bg-amber-500/10 p-1.5 rounded border border-amber-500/30'
+                        : isProbe
+                        ? 'text-cyan-300'
                         : 'text-slate-300'
                     }
                   >
@@ -291,22 +323,71 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
           </div>
         )}
 
-        {/* Error Banner when connection/authentication fails */}
+        {/* Error Banner + Copyable PowerShell Remediation Guide when connection/authentication fails */}
         {deployFailed && deployErrorText && (
-          <div
-            role="alert"
-            className="p-3 rounded-lg bg-rose-500/10 border border-rose-500/30 text-xs text-rose-300 flex items-start gap-2"
-          >
-            <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-            <div>
-              <div className="font-semibold text-rose-300">
+          <div className="space-y-3">
+            <div
+              role="alert"
+              className="p-3 rounded-lg bg-rose-500/10 border border-rose-500/30 text-xs text-rose-300 flex items-start gap-2"
+            >
+              <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+              <div>
+                <div className="font-semibold text-rose-300">
+                  {lang === 'id'
+                    ? 'Push Deployment Gagal — Status Perangkat Tetap Agentless'
+                    : 'Push Deployment Failed — Device Remains Agentless'}
+                </div>
+                <div className="text-[11px] text-rose-200/90 mt-0.5 font-mono">
+                  {deployErrorText}
+                </div>
+              </div>
+            </div>
+
+            {/* Actionable PowerShell Firewall & WinRM Quick Fix Box */}
+            <div className="p-3.5 rounded-lg bg-[#0B0F17] border border-amber-500/40 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5 text-xs font-semibold text-amber-300">
+                  <Wrench className="w-3.5 h-3.5 text-amber-400" />
+                  <span>
+                    {lang === 'id'
+                      ? `Panduan Cepat Buka Firewall & Aktifkan WinRM di PC Target (${targetDevices
+                          .map((d) => d.ipAddress)
+                          .join(', ')})`
+                      : `Quick Fix: Enable WinRM & Firewall on Target PC (${targetDevices
+                          .map((d) => d.ipAddress)
+                          .join(', ')})`}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void handleCopyPowerShell(DEFAULT_POWERSHELL_REMEDIATION)}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/40 text-[11px] font-medium transition-colors cursor-pointer"
+                >
+                  {copiedPsCmd ? (
+                    <>
+                      <Check className="w-3 h-3 text-emerald-400" />
+                      <span className="text-emerald-300">
+                        {lang === 'id' ? 'Tersalin!' : 'Copied!'}
+                      </span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3 h-3" />
+                      <span>
+                        {lang === 'id' ? 'Salin Perintah PowerShell' : 'Copy PowerShell Command'}
+                      </span>
+                    </>
+                  )}
+                </button>
+              </div>
+              <p className="text-[11px] text-slate-300">
                 {lang === 'id'
-                  ? 'Push Deployment Gagal — Status Perangkat Tetap Agentless'
-                  : 'Push Deployment Failed — Device Remains Agentless'}
-              </div>
-              <div className="text-[11px] text-rose-200/90 mt-0.5 font-mono">
-                {deployErrorText}
-              </div>
+                  ? 'Buka PowerShell (Run as Administrator) pada komputer target, tempel & jalankan perintah satu baris ini, lalu klik "Coba Push Ulang":'
+                  : 'Open PowerShell (Run as Administrator) on the target PC, paste & run this one-liner, then click "Retry Push Agent":'}
+              </p>
+              <pre className="p-2.5 rounded bg-[#161F30] border border-[#1E293B] text-[11px] font-mono text-emerald-300 overflow-x-auto whitespace-pre-wrap break-all select-all">
+                {DEFAULT_POWERSHELL_REMEDIATION}
+              </pre>
             </div>
           </div>
         )}
@@ -314,7 +395,7 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
         <div className="flex items-center justify-between pt-2 border-t border-[#1E293B]">
           <div className="flex items-center gap-2 text-xs text-slate-400">
             <ShieldCheck className="w-4 h-4 text-emerald-400" />
-            <span>AES-256-GCM Unseal · Real TCP/WinRM/SSH Probe</span>
+            <span>AES-256-GCM Unseal · Smart Probe (5985/5986/135/445/22)</span>
           </div>
 
           <div className="flex items-center gap-2.5">
@@ -343,7 +424,9 @@ export const PushDeployModal: React.FC<PushDeployModalProps> = ({
                   <>
                     <RefreshCw className="w-3.5 h-3.5 animate-spin" />
                     <span>
-                      {lang === 'id' ? 'Menghubungi Target...' : 'Connecting to Target...'}
+                      {lang === 'id'
+                        ? 'Memindai Port & Deploy...'
+                        : 'Probing Ports & Deploying...'}
                     </span>
                   </>
                 ) : (

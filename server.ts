@@ -1639,11 +1639,50 @@ async function startServer() {
       for (const dev of targetRecords) {
         const targetIp = dev.ipAddress;
         const targetHost = dev.hostname;
-        const targetPort = selectedCred.port || (selectedCred.protocol.includes('WinRM') ? 5986 : 22);
+        const preferredPort =
+          selectedCred.port || (selectedCred.protocol.includes('WinRM') ? 5985 : 22);
 
         execLogs.push(
-          `[DEPLOY-START] Menghubungi target ${targetHost} (${targetIp}:${targetPort}) menggunakan kredensial "${selectedCred.label}" (user: ${selectedCred.username})...`
+          `[DEPLOY-START] Menghubungi target ${targetHost} (${targetIp}) menggunakan kredensial "${selectedCred.label}" (user: ${selectedCred.username}, preferensi awal: ${selectedCred.protocol}:${preferredPort})...`
         );
+        execLogs.push(
+          `[SMART-PROBE] Memindai port manajemen aktif pada ${targetHost} (${targetIp}) [5985/WinRM-HTTP, 5986/WinRM-HTTPS, 135/DCOM-RPC, 445/SMB-IPC$, 22/SSH]...`
+        );
+
+        const candidateSpecs = [
+          { port: 5985, protocol: 'WinRM-HTTP', family: 'windows' as const },
+          { port: 5986, protocol: 'WinRM-HTTPS', family: 'windows' as const },
+          { port: 135, protocol: 'WMI/DCOM-RPC', family: 'windows' as const },
+          { port: 445, protocol: 'SMB/RPC-IPC$', family: 'windows' as const },
+          { port: 22, protocol: 'SSH', family: 'ssh' as const },
+        ];
+        if (!candidateSpecs.some((c) => c.port === preferredPort)) {
+          candidateSpecs.unshift({
+            port: preferredPort,
+            protocol: selectedCred.protocol.includes('SSH') ? 'SSH-Custom' : 'WinRM-Custom',
+            family: selectedCred.protocol.includes('SSH') ? ('ssh' as const) : ('windows' as const),
+          });
+        }
+
+        const probeResults = await Promise.all(
+          candidateSpecs.map(async (spec) => {
+            const check = await tryTcpPort(targetIp, spec.port, 1600);
+            return {
+              ...spec,
+              open: check.open,
+              rttMs: check.rttMs,
+            };
+          })
+        );
+        const openPorts = probeResults.filter((p) => p.open);
+        if (openPorts.length > 0) {
+          const openSummary = openPorts
+            .map((p) => `${p.port}/${p.protocol} (${p.rttMs}ms)`)
+            .join(', ');
+          execLogs.push(
+            `[SMART-PROBE] [OK] Port terbuka terdeteksi pada ${targetHost} (${targetIp}): ${openSummary}`
+          );
+        }
 
         if (isLocalIpAddress(targetIp)) {
           // Local machine deployment: collect real local hardware metrics and update ONLY this local device
@@ -1693,12 +1732,15 @@ async function startServer() {
             ...liveLogs,
           ];
         } else {
-          // Remote IP deployment: test real TCP connection & remote execution on targetIp:targetPort
-          const tcpCheck = await tryTcpPort(targetIp, targetPort, 2500);
-          if (!tcpCheck.open) {
+          const psRemediationCmd = `Enable-PSRemoting -Force; Set-Item WSMan:\\localhost\\Client\\TrustedHosts -Value '*' -Force; reg add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System /v LocalAccountTokenFilterPolicy /t REG_DWORD /d 1 /f; New-NetFirewallRule -DisplayName "VectraNet-WinRM-HTTP" -Direction Inbound -LocalPort 5985 -Protocol TCP -Action Allow`;
+
+          if (openPorts.length === 0) {
             failedCount++;
-            const errMsg = `[ERROR] [${targetHost} - ${targetIp}] Gagal terhubung ke ${targetIp}:${targetPort} (${selectedCred.protocol}): Connection timed out / refused. Pastikan layanan ${selectedCred.protocol} aktif di ${targetIp} dan port ${targetPort} diizinkan di firewall.`;
+            const errMsg = `[ERROR] [${targetHost} - ${targetIp}] Semua port manajemen (5985 WinRM-HTTP, 5986 WinRM-HTTPS, 135 WMI/RPC, 445 SMB, 22 SSH) tertutup atau diblokir firewall di ${targetIp}.`;
             execLogs.push(errMsg);
+            execLogs.push(
+              `[REMEDIATION-POWERSHELL] Jalankan perintah berikut di PowerShell (Run as Administrator) pada PC target (${targetIp}) untuk mengaktifkan WinRM & membuka firewall: ${psRemediationCmd}`
+            );
             liveLogs = [
               {
                 id: `log-deploy-err-${Date.now()}-${dev.id}`,
@@ -1707,16 +1749,26 @@ async function startServer() {
                 module: selectedCred.protocol.includes('WinRM') ? 'PUSH-WINRM' : 'PUSH-SSH',
                 deviceHostname: `${targetHost} (${targetIp})`,
                 message: errMsg,
-                latencyMs: tcpCheck.rttMs,
+                latencyMs: 1600,
               },
               ...liveLogs,
             ];
             continue;
           }
 
-          // Port is open: attempt real remote execution
+          // Smart Protocol & Port Selection (Auto-Fallback)
+          const preferredOpen = openPorts.find((p) => p.port === preferredPort);
+          const selectedEndpoint = preferredOpen || openPorts[0];
+
+          if (!preferredOpen) {
+            execLogs.push(
+              `[AUTO-FALLBACK] Port preferensi ${preferredPort} (${selectedCred.protocol}) tertutup pada ${targetIp}. Beralih otomatis ke protokol aktif ${selectedEndpoint.protocol} (Port ${selectedEndpoint.port}, RTT ${selectedEndpoint.rttMs}ms)...`
+            );
+          }
+
+          // Attempt remote execution on the detected open endpoint
           try {
-            if (selectedCred.protocol.includes('SSH')) {
+            if (selectedEndpoint.family === 'ssh') {
               const sshArgs = [
                 '-o',
                 'BatchMode=yes',
@@ -1725,29 +1777,32 @@ async function startServer() {
                 '-o',
                 'ConnectTimeout=4',
                 '-p',
-                String(targetPort),
+                String(selectedEndpoint.port),
                 `${selectedCred.username}@${targetIp}`,
                 'hostname && uname -sr',
               ];
               await execFileAsync('ssh', sshArgs, { timeout: 6000 });
             } else {
               throw new Error(
-                `Autentikasi ${selectedCred.protocol} (user: ${selectedCred.username}, secret length: ${decryptedPassword.length}) ke ${targetIp}:${targetPort} memerlukan Go Backend Windows (WinRM/CIM) atau layanan OpenSSH aktif di target.`
+                `Endpoint ${selectedEndpoint.protocol} (${targetIp}:${selectedEndpoint.port}) terbuka, namun otentikasi Workgroup (${targetIp}\\${selectedCred.username}) membutuhkan eksekusi lewat Go Backend Windows (WinRM/CIM/WMI Auto-Fallback) atau layanan WinRM aktif di target.`
               );
             }
           } catch (remoteErr) {
             failedCount++;
-            const errMsg = `[ERROR] [${targetHost} - ${targetIp}] Eksekusi ${selectedCred.protocol} ke ${selectedCred.username}@${targetIp}:${targetPort} gagal: ${(remoteErr as Error).message}`;
+            const errMsg = `[ERROR] [${targetHost} - ${targetIp}] Eksekusi via ${selectedEndpoint.protocol} (${selectedCred.username}@${targetIp}:${selectedEndpoint.port}) gagal: ${(remoteErr as Error).message}`;
             execLogs.push(errMsg);
+            execLogs.push(
+              `[REMEDIATION-POWERSHELL] Jalankan perintah berikut di PowerShell (Run as Administrator) pada PC target (${targetIp}): ${psRemediationCmd}`
+            );
             liveLogs = [
               {
                 id: `log-deploy-err-${Date.now()}-${dev.id}`,
                 timestamp: new Date().toTimeString().slice(0, 8) + '.420',
                 level: 'ERROR',
-                module: selectedCred.protocol.includes('WinRM') ? 'PUSH-WINRM' : 'PUSH-SSH',
+                module: selectedEndpoint.family === 'ssh' ? 'PUSH-SSH' : 'PUSH-WINRM',
                 deviceHostname: `${targetHost} (${targetIp})`,
                 message: errMsg,
-                latencyMs: tcpCheck.rttMs,
+                latencyMs: selectedEndpoint.rttMs,
               },
               ...liveLogs,
             ];
