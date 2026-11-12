@@ -283,50 +283,63 @@ export const CredentialVaultView: React.FC<CredentialVaultViewProps> = ({
         </div>
 
         <div className="space-y-3">
-          {credentials.map((cred) => (
-            <div
-              key={cred.id}
-              className="p-4 rounded-lg bg-[#0B0F17] border border-[#1E293B] flex flex-col sm:flex-row sm:items-center justify-between gap-4"
-            >
-              <div className="space-y-1.5">
-                <div className="flex items-center gap-2.5">
-                  <KeyRound className="w-4 h-4 text-emerald-400 shrink-0" />
-                  <span className="text-sm font-semibold text-slate-100">
-                    {cred.label}
-                  </span>
-                </div>
-                <div className="text-xs text-slate-400 font-mono flex flex-wrap items-center gap-2">
-                  <span className="text-cyan-400">{cred.protocol}</span>
-                  <span>·</span>
-                  <span>User: {cred.username}</span>
-                  <span>·</span>
-                  <span>Port: {cred.port}</span>
-                  <span>·</span>
-                  <span>Scope: {cred.scopeSubnet}</span>
-                </div>
-                <div className="text-[11px] font-mono text-slate-400 flex flex-wrap items-center gap-2">
-                  <span>Cipher: {cred.cipherPreview}</span>
-                  <span>·</span>
-                  <span>IV: {cred.ivHex}</span>
-                  <span>·</span>
-                  <span className="text-emerald-400/90">{cred.keyFingerprint}</span>
-                </div>
-                <div className="text-[11px] text-slate-400">
-                  {lang === 'id' ? 'Rotasi Terakhir:' : 'Last Rotated:'}{' '}
-                  <span className="font-mono">{cred.lastRotated}</span> · Oleh {cred.createdBy}
-                </div>
+          {credentials.length === 0 ? (
+            <div className="p-6 rounded-lg bg-[#0B0F17] border border-[#1E293B] text-center space-y-1.5">
+              <div className="text-xs font-semibold text-slate-200">
+                {lang === 'id'
+                  ? 'Zero-State: Brankas Kredensial Kosong'
+                  : 'Zero-State: Credential Vault is Empty'}
               </div>
+              <p className="text-xs text-slate-400">
+                {lang === 'id'
+                  ? 'Tambahkan kredensial WinRM-HTTPS, SSH-Ed25519, atau SNMPv3 di formulir sebelah kiri untuk menyimpannya secara terenkripsi (AES-256-GCM) ke PostgreSQL.'
+                  : 'Add a WinRM-HTTPS, SSH-Ed25519, or SNMPv3 credential using the form on the left to store it encrypted (AES-256-GCM) in PostgreSQL.'}
+              </p>
+            </div>
+          ) : (
+            credentials.map((cred) => (
+              <div
+                key={cred.id}
+                className="p-4 rounded-lg bg-[#0B0F17] border border-[#1E293B] flex flex-col sm:flex-row sm:items-center justify-between gap-4"
+              >
+                <div className="space-y-1.5">
+                  <div className="flex items-center gap-2.5">
+                    <KeyRound className="w-4 h-4 text-emerald-400 shrink-0" />
+                    <span className="text-sm font-semibold text-slate-100">
+                      {cred.label}
+                    </span>
+                  </div>
+                  <div className="text-xs text-slate-400 font-mono flex flex-wrap items-center gap-2">
+                    <span className="text-cyan-400">{cred.protocol}</span>
+                    <span>·</span>
+                    <span>User: {cred.username}</span>
+                    <span>·</span>
+                    <span>Port: {cred.port}</span>
+                    <span>·</span>
+                    <span>Scope: {cred.scopeSubnet}</span>
+                  </div>
+                  <div className="text-[11px] font-mono text-slate-400 flex flex-wrap items-center gap-2">
+                    <span>Cipher: {cred.cipherPreview}</span>
+                    <span>·</span>
+                    <span>IV: {cred.ivHex}</span>
+                    <span>·</span>
+                    <span className="text-emerald-400/90">{cred.keyFingerprint}</span>
+                  </div>
+                  <div className="text-[11px] text-slate-400">
+                    {lang === 'id' ? 'Rotasi Terakhir:' : 'Last Rotated:'}{' '}
+                    <span className="font-mono">{cred.lastRotated}</span> · Oleh {cred.createdBy}
+                  </div>
+                </div>
 
-              <div className="flex items-center gap-2 shrink-0">
-                <button
-                  type="button"
-                  onClick={() => onRotateKey(cred.id)}
-                  className="px-3 py-1.5 text-xs font-medium text-slate-200 bg-[#161F30] hover:bg-slate-800 border border-[#1E293B] rounded-lg transition-colors flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
-                >
-                  <RefreshCw className="w-3.5 h-3.5 text-emerald-400" />
-                  {lang === 'id' ? 'Rotasi IV/Key' : 'Rotate IV/Key'}
-                </button>
-                {credentials.length > 1 && (
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => onRotateKey(cred.id)}
+                    className="px-3 py-1.5 text-xs font-medium text-slate-200 bg-[#161F30] hover:bg-slate-800 border border-[#1E293B] rounded-lg transition-colors flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5 text-emerald-400" />
+                    {lang === 'id' ? 'Rotasi IV/Key' : 'Rotate IV/Key'}
+                  </button>
                   <button
                     type="button"
                     aria-label={`Delete credential ${cred.label}`}
@@ -335,10 +348,10 @@ export const CredentialVaultView: React.FC<CredentialVaultViewProps> = ({
                   >
                     <Trash2 className="w-4 h-4" />
                   </button>
-                )}
+                </div>
               </div>
-            </div>
-          ))}
+            ))
+          )}
         </div>
       </div>
     </div>

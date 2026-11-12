@@ -1,6 +1,22 @@
-export type DeviceOS = 'Windows Server' | 'Windows 11' | 'Ubuntu Linux' | 'RHEL Linux' | 'macOS Sequoia' | 'Cisco IOS-XE' | 'MikroTik RouterOS' | 'Android Enterprise' | 'iOS Managed';
+export type DeviceOS =
+  | 'Windows Server'
+  | 'Windows 11'
+  | 'Ubuntu Linux'
+  | 'RHEL Linux'
+  | 'macOS Sequoia'
+  | 'Cisco IOS-XE'
+  | 'MikroTik RouterOS'
+  | 'Android Enterprise'
+  | 'iOS Managed'
+  | string;
 
-export type DeviceRole = 'core-router' | 'dist-switch' | 'access-switch' | 'server' | 'workstation' | 'mobile';
+export type DeviceRole =
+  | 'core-router'
+  | 'dist-switch'
+  | 'access-switch'
+  | 'server'
+  | 'workstation'
+  | 'mobile';
 
 export type DeviceStatus = 'online' | 'warning' | 'offline';
 
@@ -55,7 +71,13 @@ export interface DeviceAsset {
   software: InstalledSoftwareItem[];
 }
 
-export type CredentialProtocol = 'WinRM-HTTPS' | 'SSH-Ed25519' | 'SSH-Password' | 'SNMPv3-AuthPriv' | 'SNMPv2c' | 'LDAP-AD';
+export type CredentialProtocol =
+  | 'WinRM-HTTPS'
+  | 'SSH-Ed25519'
+  | 'SSH-Password'
+  | 'SNMPv3-AuthPriv'
+  | 'SNMPv2c'
+  | 'LDAP-AD';
 
 export interface CredentialVaultEntry {
   id: string;
@@ -89,10 +111,30 @@ export interface SystemLogEntry {
   id: string;
   timestamp: string;
   level: 'INFO' | 'WARN' | 'ERROR';
-  module: 'INGEST-TLS' | 'SWEEPER-ICMP' | 'PUSH-WINRM' | 'PUSH-SSH' | 'SNMP-POLLER' | 'VAULT-AES256';
+  module:
+    | 'INGEST-TLS'
+    | 'SWEEPER-ICMP'
+    | 'PUSH-WINRM'
+    | 'PUSH-SSH'
+    | 'SNMP-POLLER'
+    | 'VAULT-AES256';
   deviceHostname?: string;
   message: string;
   latencyMs?: number;
+}
+
+export interface SystemMetricsSummary {
+  activeGoroutines: number;
+  maxGoroutines: number;
+  heapRssMb: number;
+  compressionRatioPct: number;
+  avgIngestPacketKb: number;
+  avgAgentRamMb: number;
+  totalTelemetryRows: number;
+  dbConnected: boolean;
+  dbDsnMasked: string;
+  lastPolledAt: string;
+  logs: SystemLogEntry[];
 }
 
 export interface NotificationItem {

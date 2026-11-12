@@ -222,7 +222,7 @@ export function computeFleetSummary(devices: DeviceAsset[]) {
   const avgAgentRamMb =
     agentRamValues.length > 0
       ? Number((agentRamValues.reduce((a, b) => a + b, 0) / agentRamValues.length).toFixed(1))
-      : 12.6;
+      : 0;
 
   return {
     total,

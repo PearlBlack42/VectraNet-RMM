@@ -145,35 +145,43 @@ export const AdminConfigView: React.FC<AdminConfigViewProps> = ({
         </form>
 
         <div className="space-y-2.5 pt-2">
-          {users.map((u) => (
-            <div
-              key={u.id}
-              className="p-3.5 rounded-lg bg-[#0B0F17] border border-[#1E293B] flex items-center justify-between gap-3"
-            >
-              <div>
-                <div className="flex items-center gap-2">
-                  <span className="text-sm font-semibold text-slate-100">{u.fullName}</span>
-                  <span className="text-xs text-slate-400">·</span>
-                  <span className="text-xs font-mono text-emerald-400">{u.role}</span>
-                </div>
-                <div className="text-xs text-slate-400 mt-0.5">
-                  {u.email} · MFA: {u.mfaEnabled ? 'FIDO2/TOTP' : 'Off'} · Login: {u.lastLogin}
-                </div>
-              </div>
-
-              <button
-                type="button"
-                onClick={() => onToggleUserStatus(u.id)}
-                className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors cursor-pointer ${
-                  u.status === 'Active'
-                    ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
-                    : 'bg-rose-500/10 text-rose-300 border-rose-500/30'
-                }`}
-              >
-                {u.status}
-              </button>
+          {users.length === 0 ? (
+            <div className="p-4 rounded-lg bg-[#0B0F17] border border-[#1E293B] text-xs text-slate-400">
+              {lang === 'id'
+                ? 'Zero-State: Belum ada operator RBAC yang terdaftar. Tambahkan operator baru di atas.'
+                : 'Zero-State: No RBAC operators registered yet. Add a new operator above.'}
             </div>
-          ))}
+          ) : (
+            users.map((u) => (
+              <div
+                key={u.id}
+                className="p-3.5 rounded-lg bg-[#0B0F17] border border-[#1E293B] flex items-center justify-between gap-3"
+              >
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-semibold text-slate-100">{u.fullName}</span>
+                    <span className="text-xs text-slate-400">·</span>
+                    <span className="text-xs font-mono text-emerald-400">{u.role}</span>
+                  </div>
+                  <div className="text-xs text-slate-400 mt-0.5">
+                    {u.email} · MFA: {u.mfaEnabled ? 'FIDO2/TOTP' : 'Off'} · Login: {u.lastLogin}
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => onToggleUserStatus(u.id)}
+                  className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors cursor-pointer ${
+                    u.status === 'Active'
+                      ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
+                      : 'bg-rose-500/10 text-rose-300 border-rose-500/30'
+                  }`}
+                >
+                  {u.status}
+                </button>
+              </div>
+            ))
+          )}
         </div>
       </div>
 

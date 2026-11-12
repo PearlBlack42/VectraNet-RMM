@@ -248,6 +248,46 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
               );
             })}
 
+            {/* Zero-State Message when no devices are ingested yet */}
+            {positionedNodes.length === 0 && (
+              <g transform="translate(480, 270)">
+                <rect
+                  x="-250"
+                  y="-46"
+                  width="500"
+                  height="92"
+                  rx="10"
+                  fill="#161F30"
+                  stroke="#1E293B"
+                  strokeWidth="1.5"
+                />
+                <text
+                  x="0"
+                  y="-8"
+                  textAnchor="middle"
+                  fill="#F8FAFC"
+                  fontSize="13"
+                  fontWeight="600"
+                >
+                  {lang === 'id'
+                    ? 'Zero-State: Belum Ada Node Jaringan Terdeteksi'
+                    : 'Zero-State: No Network Nodes Discovered Yet'}
+                </text>
+                <text
+                  x="0"
+                  y="16"
+                  textAnchor="middle"
+                  fill="#94A3B8"
+                  fontSize="11"
+                  fontFamily="JetBrains Mono"
+                >
+                  {lang === 'id'
+                    ? 'Menunggu data real-time dari GET /api/v1/devices atau agen lokal'
+                    : 'Waiting for real-time telemetry from GET /api/v1/devices'}
+                </text>
+              </g>
+            )}
+
             {/* Nodes */}
             {positionedNodes.map(({ device, x, y }) => {
               const isSelected = device.id === selectedId;
@@ -342,7 +382,7 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
       </div>
 
       {/* Selected Node Inspector */}
-      {selectedDevice && (
+      {selectedDevice ? (
         <div className="xl:col-span-4 bg-[#161F30] border border-[#1E293B] rounded-xl p-5 space-y-5">
           <div className="flex items-start justify-between gap-3 border-b border-[#1E293B] pb-4">
             <div className="flex items-center gap-3">
@@ -443,6 +483,17 @@ export const TopologyView: React.FC<TopologyViewProps> = ({
               </span>
             </div>
           )}
+        </div>
+      ) : (
+        <div className="xl:col-span-4 bg-[#161F30] border border-[#1E293B] rounded-xl p-6 space-y-3">
+          <h3 className="text-sm font-semibold text-white">
+            {lang === 'id' ? 'Inspektor Node Topologi' : 'Topology Node Inspector'}
+          </h3>
+          <p className="text-xs text-slate-400 leading-relaxed">
+            {lang === 'id'
+              ? 'Belum ada perangkat yang terdaftar di database PostgreSQL (vectranet_rmm). Jalankan agen native lokal atau lakukan pemindaian subnet CIDR untuk melihat topologi L2/L3.'
+              : 'No devices registered in PostgreSQL (vectranet_rmm) yet. Run a local native agent or execute a CIDR subnet scan to populate the L2/L3 topology.'}
+          </p>
         </div>
       )}
     </div>

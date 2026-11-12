@@ -7,12 +7,18 @@ import {
   Gauge,
   PlusCircle,
 } from 'lucide-react';
-import { DeviceAsset, EngineConfigState, SystemLogEntry } from '../types/network';
+import {
+  DeviceAsset,
+  EngineConfigState,
+  SystemLogEntry,
+  SystemMetricsSummary,
+} from '../types/network';
 import { calculateAdaptiveHeartbeat } from '../utils/networkEngine';
 
 interface SystemHealthLogsViewProps {
   devices: DeviceAsset[];
   logs: SystemLogEntry[];
+  metrics: SystemMetricsSummary;
   config: EngineConfigState;
   lang: 'id' | 'en';
   onEmitTestIngest: () => void;
@@ -21,6 +27,7 @@ interface SystemHealthLogsViewProps {
 export const SystemHealthLogsView: React.FC<SystemHealthLogsViewProps> = ({
   devices,
   logs,
+  metrics,
   config,
   lang,
   onEmitTestIngest,
@@ -48,7 +55,7 @@ export const SystemHealthLogsView: React.FC<SystemHealthLogsViewProps> = ({
 
   return (
     <div className="space-y-6">
-      {/* Core Engine & TimescaleDB Health Metrics */}
+      {/* Core Engine & TimescaleDB Real-Time Health Metrics from GET /api/v1/metrics */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
         <div className="bg-[#161F30] border border-[#1E293B] rounded-xl p-4">
           <div className="flex items-center justify-between text-xs text-slate-400">
@@ -56,10 +63,10 @@ export const SystemHealthLogsView: React.FC<SystemHealthLogsViewProps> = ({
             <Cpu className="w-4 h-4 text-emerald-400" />
           </div>
           <div className="text-2xl font-bold font-mono tabular-nums text-white mt-2">
-            28 / {config.maxScannerGoroutines}
+            {metrics.activeGoroutines} / {config.maxScannerGoroutines}
           </div>
           <p className="text-xs text-slate-400 mt-1">
-            Goroutines Aktif · Heap RSS: 34.2 MB
+            Goroutines Aktif · Heap RSS: {metrics.heapRssMb} MB
           </p>
         </div>
 
@@ -69,10 +76,10 @@ export const SystemHealthLogsView: React.FC<SystemHealthLogsViewProps> = ({
             <Database className="w-4 h-4 text-cyan-400" />
           </div>
           <div className="text-2xl font-bold font-mono tabular-nums text-white mt-2">
-            92.4%
+            {metrics.compressionRatioPct}%
           </div>
           <p className="text-xs text-slate-400 mt-1">
-            Rasio Kompresi Kolumnar · Retensi {config.timescaleRetentionDays}h
+            Baris Telemetri: {metrics.totalTelemetryRows} · Retensi {config.timescaleRetentionDays}h
           </p>
         </div>
 
@@ -82,10 +89,10 @@ export const SystemHealthLogsView: React.FC<SystemHealthLogsViewProps> = ({
             <Activity className="w-4 h-4 text-emerald-400" />
           </div>
           <div className="text-2xl font-bold font-mono tabular-nums text-white mt-2">
-            1.64 KB/pkt
+            {metrics.avgIngestPacketKb} KB/pkt
           </div>
           <p className="text-xs text-slate-400 mt-1">
-            Hemat Bandwidth 78% dibanding JSON mentah
+            Endpoint: /api/v1/agent/ingest · Poll: {metrics.lastPolledAt}
           </p>
         </div>
 
@@ -95,10 +102,10 @@ export const SystemHealthLogsView: React.FC<SystemHealthLogsViewProps> = ({
             <Gauge className="w-4 h-4 text-emerald-400" />
           </div>
           <div className="text-2xl font-bold font-mono tabular-nums text-emerald-400 mt-2">
-            11.9 MB
+            {metrics.avgAgentRamMb} MB
           </div>
           <p className="text-xs text-slate-400 mt-1">
-            Batas Cgroup/Runtime: {config.maxAgentRamMb} MB (CPU &lt; 0.5%)
+            Batas Cgroup/Runtime: {config.maxAgentRamMb} MB (CPU &lt; 1%)
           </p>
         </div>
       </div>
@@ -179,7 +186,7 @@ export const SystemHealthLogsView: React.FC<SystemHealthLogsViewProps> = ({
               </span>
             </div>
             <div className="flex items-center justify-between">
-              <span className="text-slate-400"> Kompresi Payload:</span>
+              <span className="text-slate-400">Kompresi Payload:</span>
               <span className="font-mono text-slate-300">
                 Gzip Level {config.gzipCompressionLevel} via {config.tlsMinVersion}
               </span>
@@ -193,30 +200,38 @@ export const SystemHealthLogsView: React.FC<SystemHealthLogsViewProps> = ({
                 ? 'Utilisasi Real-Time Perangkat Teratas (TimescaleDB)'
                 : 'Top Endpoint Real-Time Utilization (TimescaleDB)'}
             </h3>
-            {devices.slice(0, 5).map((dev) => {
-              const ramPct = Math.round((dev.ramUsedGb / Math.max(1, dev.ramTotalGb)) * 100);
-              return (
-                <div
-                  key={dev.id}
-                  className="p-2.5 rounded-lg bg-[#0B0F17] border border-[#1E293B] text-xs space-y-1.5"
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="font-medium text-slate-200">{dev.hostname}</span>
-                    <span className="font-mono tabular-nums text-slate-400">
-                      CPU {dev.cpuUsagePct}% · RAM {ramPct}%
-                    </span>
+            {devices.length === 0 ? (
+              <div className="p-3.5 rounded-lg bg-[#0B0F17] border border-[#1E293B] text-xs text-slate-400">
+                {lang === 'id'
+                  ? 'Zero-State: Belum ada metrik perangkat yang masuk ke tabel telemetry_logs.'
+                  : 'Zero-State: No device metrics ingested into telemetry_logs yet.'}
+              </div>
+            ) : (
+              devices.slice(0, 5).map((dev) => {
+                const ramPct = Math.round((dev.ramUsedGb / Math.max(1, dev.ramTotalGb)) * 100);
+                return (
+                  <div
+                    key={dev.id}
+                    className="p-2.5 rounded-lg bg-[#0B0F17] border border-[#1E293B] text-xs space-y-1.5"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="font-medium text-slate-200">{dev.hostname}</span>
+                      <span className="font-mono tabular-nums text-slate-400">
+                        CPU {dev.cpuUsagePct}% · RAM {ramPct}%
+                      </span>
+                    </div>
+                    <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                      <div
+                        className={`h-full ${
+                          dev.cpuUsagePct > 80 ? 'bg-rose-500' : 'bg-emerald-500'
+                        }`}
+                        style={{ width: `${Math.min(100, dev.cpuUsagePct)}%` }}
+                      />
+                    </div>
                   </div>
-                  <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden">
-                    <div
-                      className={`h-full ${
-                        dev.cpuUsagePct > 80 ? 'bg-rose-500' : 'bg-emerald-500'
-                      }`}
-                      style={{ width: `${Math.min(100, dev.cpuUsagePct)}%` }}
-                    />
-                  </div>
-                </div>
-              );
-            })}
+                );
+              })
+            )}
           </div>
         </div>
 
@@ -263,49 +278,64 @@ export const SystemHealthLogsView: React.FC<SystemHealthLogsViewProps> = ({
                 className="px-3 py-1.5 text-xs font-medium bg-emerald-500 hover:bg-emerald-400 text-slate-950 rounded-lg transition-colors flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
               >
                 <PlusCircle className="w-3.5 h-3.5" />
-                {lang === 'id' ? 'Simulasi Ingest Agen' : 'Simulate Agent Ingest'}
+                {lang === 'id' ? 'Kirim Payload Uji Ingest' : 'Send Test Ingest Payload'}
               </button>
             </div>
           </div>
 
           <div className="space-y-2 max-h-[460px] overflow-y-auto font-mono text-xs">
-            {filteredLogs.map((entry) => (
-              <div
-                key={entry.id}
-                className="p-3 rounded-lg bg-[#0B0F17] border border-[#1E293B] flex flex-col sm:flex-row sm:items-center justify-between gap-2"
-              >
-                <div className="space-y-1">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="text-slate-500 tabular-nums">{entry.timestamp}</span>
-                    <span
-                      className={`font-semibold ${
-                        entry.level === 'ERROR'
-                          ? 'text-rose-400'
-                          : entry.level === 'WARN'
-                          ? 'text-amber-400'
-                          : 'text-emerald-400'
-                      }`}
-                    >
-                      [{entry.level}]
-                    </span>
-                    <span className="text-cyan-400">{entry.module}</span>
-                    {entry.deviceHostname && (
-                      <>
-                        <span className="text-slate-600">·</span>
-                        <span className="text-slate-200">{entry.deviceHostname}</span>
-                      </>
-                    )}
-                  </div>
-                  <p className="text-slate-300 font-sans text-xs">{entry.message}</p>
+            {filteredLogs.length === 0 ? (
+              <div className="p-6 rounded-lg bg-[#0B0F17] border border-[#1E293B] text-center space-y-2">
+                <div className="text-slate-200 font-sans font-semibold text-xs">
+                  {lang === 'id'
+                    ? 'Zero-State: Belum Ada Log Telemetri Masuk'
+                    : 'Zero-State: No Telemetry Logs Recorded Yet'}
                 </div>
-
-                {typeof entry.latencyMs === 'number' && (
-                  <span className="text-[11px] text-slate-400 tabular-nums shrink-0">
-                    {entry.latencyMs} ms
-                  </span>
-                )}
+                <p className="text-slate-400 font-sans text-xs">
+                  {lang === 'id'
+                    ? 'Menunggu agen mengirimkan frame Gzip ke POST /api/v1/agent/ingest atau klik "Kirim Payload Uji Ingest" di atas.'
+                    : 'Waiting for agents to send Gzip frames to POST /api/v1/agent/ingest or click "Send Test Ingest Payload" above.'}
+                </p>
               </div>
-            ))}
+            ) : (
+              filteredLogs.map((entry) => (
+                <div
+                  key={entry.id}
+                  className="p-3 rounded-lg bg-[#0B0F17] border border-[#1E293B] flex flex-col sm:flex-row sm:items-center justify-between gap-2"
+                >
+                  <div className="space-y-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-slate-500 tabular-nums">{entry.timestamp}</span>
+                      <span
+                        className={`font-semibold ${
+                          entry.level === 'ERROR'
+                            ? 'text-rose-400'
+                            : entry.level === 'WARN'
+                            ? 'text-amber-400'
+                            : 'text-emerald-400'
+                        }`}
+                      >
+                        [{entry.level}]
+                      </span>
+                      <span className="text-cyan-400">{entry.module}</span>
+                      {entry.deviceHostname && (
+                        <>
+                          <span className="text-slate-600">·</span>
+                          <span className="text-slate-200">{entry.deviceHostname}</span>
+                        </>
+                      )}
+                    </div>
+                    <p className="text-slate-300 font-sans text-xs">{entry.message}</p>
+                  </div>
+
+                  {typeof entry.latencyMs === 'number' && (
+                    <span className="text-[11px] text-slate-400 tabular-nums shrink-0">
+                      {entry.latencyMs} ms
+                    </span>
+                  )}
+                </div>
+              ))
+            )}
           </div>
         </div>
       </div>

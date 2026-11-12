@@ -118,4 +118,9 @@ test('filterDevices and applyAgentDeployment transition agentless endpoints to a
   const summary = computeFleetSummary(deployed);
   assert.equal(summary.activeAgents, 1);
   assert.equal(summary.agentlessCount, 0);
+
+  const emptySummary = computeFleetSummary([]);
+  assert.equal(emptySummary.total, 0);
+  assert.equal(emptySummary.activeAgents, 0);
+  assert.equal(emptySummary.avgAgentRamMb, 0);
 });

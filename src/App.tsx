@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import {
   Server,
   Network,
@@ -15,6 +15,8 @@ import {
   CheckCircle2,
   AlertTriangle,
   ShieldCheck,
+  RefreshCw,
+  PlusCircle,
 } from 'lucide-react';
 import {
   AdminUserEntry,
@@ -25,14 +27,11 @@ import {
   EngineConfigState,
   NotificationItem,
   SystemLogEntry,
+  SystemMetricsSummary,
 } from './types/network';
 import {
-  INITIAL_ADMIN_USERS,
-  INITIAL_CREDENTIALS,
-  INITIAL_DEVICES,
   INITIAL_ENGINE_CONFIG,
-  INITIAL_LOGS,
-  INITIAL_NOTIFICATIONS,
+  INITIAL_SYSTEM_METRICS,
 } from './data/seedNetworkData';
 import {
   applyAgentDeployment,
@@ -56,29 +55,31 @@ type ActiveTab =
   | 'admin'
   | 'blueprints';
 
+const API_BASE = (import.meta.env.VITE_API_BASE_URL as string) || '';
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('inventory');
   const [lang, setLang] = useState<'id' | 'en'>('id');
 
-  const [devices, setDevices] = useState<DeviceAsset[]>(INITIAL_DEVICES);
-  const [credentials, setCredentials] =
-    useState<CredentialVaultEntry[]>(INITIAL_CREDENTIALS);
-  const [logs, setLogs] = useState<SystemLogEntry[]>(INITIAL_LOGS);
-  const [notifications, setNotifications] =
-    useState<NotificationItem[]>(INITIAL_NOTIFICATIONS);
-  const [adminUsers, setAdminUsers] =
-    useState<AdminUserEntry[]>(INITIAL_ADMIN_USERS);
+  // Zero-state initialization: no static fake data
+  const [devices, setDevices] = useState<DeviceAsset[]>([]);
+  const [credentials, setCredentials] = useState<CredentialVaultEntry[]>([]);
+  const [logs, setLogs] = useState<SystemLogEntry[]>([]);
+  const [metrics, setMetrics] = useState<SystemMetricsSummary>(INITIAL_SYSTEM_METRICS);
+  const [notifications, setNotifications] = useState<NotificationItem[]>([]);
+  const [adminUsers, setAdminUsers] = useState<AdminUserEntry[]>([]);
   const [engineConfig, setEngineConfig] =
     useState<EngineConfigState>(INITIAL_ENGINE_CONFIG);
+
+  // Real-time polling state
+  const [isPolling, setIsPolling] = useState<boolean>(false);
+  const [apiStatus, setApiStatus] = useState<'connected' | 'syncing' | 'offline'>('syncing');
 
   // Inventory filters & selection
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | DeviceStatus>('all');
   const [agentFilter, setAgentFilter] = useState<'all' | AgentState>('all');
-  const [selectedDeviceIds, setSelectedDeviceIds] = useState<string[]>([
-    'dev-srv-03',
-    'dev-srv-04',
-  ]);
+  const [selectedDeviceIds, setSelectedDeviceIds] = useState<string[]>([]);
 
   // Subnet CIDR Scanner state
   const [scanCidrInput, setScanCidrInput] = useState('10.24.10.0/24');
@@ -90,6 +91,56 @@ export default function App() {
   const [isDeployModalOpen, setIsDeployModalOpen] = useState(false);
   const [inspectDevice, setInspectDevice] = useState<DeviceAsset | null>(null);
   const [isNotifOpen, setIsNotifOpen] = useState(false);
+
+  // Periodic Real-Time API Fetching (Every 5 seconds)
+  const fetchLiveTelemetry = useCallback(async () => {
+    setIsPolling(true);
+    try {
+      const [devRes, metRes, credRes] = await Promise.all([
+        fetch(`${API_BASE}/api/v1/devices`),
+        fetch(`${API_BASE}/api/v1/metrics`),
+        fetch(`${API_BASE}/api/v1/credentials`),
+      ]);
+
+      if (devRes.ok) {
+        const devData = (await devRes.json()) as DeviceAsset[];
+        if (Array.isArray(devData)) {
+          setDevices(devData);
+        }
+      }
+
+      if (metRes.ok) {
+        const metData = (await metRes.json()) as SystemMetricsSummary;
+        if (metData && typeof metData === 'object') {
+          setMetrics(metData);
+          if (Array.isArray(metData.logs)) {
+            setLogs(metData.logs);
+          }
+        }
+      }
+
+      if (credRes.ok) {
+        const credData = (await credRes.json()) as CredentialVaultEntry[];
+        if (Array.isArray(credData)) {
+          setCredentials(credData);
+        }
+      }
+
+      setApiStatus('connected');
+    } catch {
+      setApiStatus('offline');
+    } finally {
+      setIsPolling(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void fetchLiveTelemetry();
+    const pollTimer = window.setInterval(() => {
+      void fetchLiveTelemetry();
+    }, 5000);
+    return () => window.clearInterval(pollTimer);
+  }, [fetchLiveTelemetry]);
 
   const fleetSummary = useMemo(() => computeFleetSummary(devices), [devices]);
 
@@ -119,28 +170,24 @@ export default function App() {
     setIsDeployModalOpen(true);
   };
 
-  const handleConfirmDeploy = (targetIds: string[], credentialId: string) => {
-    const cred = credentials.find((c) => c.id === credentialId);
+  const handleConfirmDeploy = async (targetIds: string[], credentialId: string) => {
     setDevices((prev) => applyAgentDeployment(prev, targetIds, 'v2.4.1-go'));
+
+    try {
+      await fetch(`${API_BASE}/api/v1/deploy`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ targetIds, credentialId }),
+      });
+      await fetchLiveTelemetry();
+    } catch {
+      // Fallback local state already updated
+    }
 
     const deployedNames = devices
       .filter((d) => targetIds.includes(d.id))
       .map((d) => d.hostname)
       .join(', ');
-
-    const nowStamp = new Date().toTimeString().slice(0, 8) + '.420';
-    setLogs((prev) => [
-      {
-        id: `log-${Date.now()}`,
-        timestamp: nowStamp,
-        level: 'INFO',
-        module: cred?.protocol.includes('WinRM') ? 'PUSH-WINRM' : 'PUSH-SSH',
-        deviceHostname: deployedNames,
-        message: `Remote Agent Push v2.4.1-go succeeded (${targetIds.length} endpoints) using Vault key ${cred?.keyFingerprint}`,
-        latencyMs: 18.4,
-      },
-      ...prev,
-    ]);
 
     setNotifications((prev) => [
       {
@@ -159,7 +206,7 @@ export default function App() {
     setSelectedDeviceIds((prev) => prev.filter((id) => !targetIds.includes(id)));
   };
 
-  const handleRunSubnetScan = (e: React.FormEvent) => {
+  const handleRunSubnetScan = async (e: React.FormEvent) => {
     e.preventDefault();
     setScanError(null);
     setScanMessage(null);
@@ -170,79 +217,56 @@ export default function App() {
       return;
     }
 
-    const octetPrefix = parsed.networkAddress.split('.').slice(0, 3).join('.');
-    const randomHost = Math.floor(110 + (devices.length * 17) % 120);
-    const newIp = `${octetPrefix}.${randomHost}`;
-    const newHost = `SRV-AUTO-NODE${devices.length + 1}`;
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/scan`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cidr: scanCidrInput.trim() }),
+      });
 
-    const newDevice: DeviceAsset = {
-      id: `dev-scan-${Date.now()}`,
-      hostname: newHost,
-      ipAddress: newIp,
-      macAddress: `00:15:5D:8A:${randomHost.toString(16).toUpperCase().padStart(2, '0')}:F1`,
-      os: 'Ubuntu Linux',
-      osVersion: '24.04 LTS',
-      kernelArch: '6.8.0-generic x86_64',
-      role: 'server',
-      status: 'online',
-      agentState: 'agentless',
-      cpuModel: 'AMD EPYC 7543P',
-      cpuCores: 8,
-      cpuUsagePct: 24,
-      ramTotalGb: 32,
-      ramUsedGb: 9.8,
-      diskTotalGb: 512,
-      diskUsedGb: 124.0,
-      lastSeen: 'Baru ditemukan / Just discovered',
-      subnet: scanCidrInput.trim(),
-      location: 'DC-Jakarta-AutoSweep',
-      uplinkDeviceId: 'dev-sw-01',
-      uplinkPort: 'eth0 -> ether19',
-      latencyMs: 1.5,
-      interfaces: [
-        {
-          id: `if-scan-${Date.now()}`,
-          name: 'eth0',
-          ipAddress: newIp,
-          macAddress: `00:15:5D:8A:${randomHost.toString(16).toUpperCase().padStart(2, '0')}:F1`,
-          speedMbps: 10000,
-          vlan: 10,
-          rxMbps: 84.2,
-          txMbps: 61.5,
-          isPrimary: true,
-        },
-      ],
-      software: [
-        {
-          name: 'OpenSSH Server',
-          version: '9.6p1',
-          publisher: 'OpenBSD',
-          installDate: '2026-10-01',
-        },
-      ],
-    };
+      if (res.ok) {
+        const discovered = (await res.json()) as { id?: string; hostname?: string; ip?: string; ipAddress?: string };
+        await fetchLiveTelemetry();
+        const hostLabel = discovered.hostname || 'NEW-ENDPOINT';
+        const ipLabel = discovered.ipAddress || discovered.ip || scanCidrInput;
+        if (discovered.id) {
+          setSelectedDeviceIds((prev) => [discovered.id as string, ...prev]);
+        }
+        setScanMessage(
+          lang === 'id'
+            ? `Sweep CIDR ${scanCidrInput} selesai (${parsed.estimatedHosts} IP dipindai): host agentless baru ${hostLabel} (${ipLabel}) disimpan ke database.`
+            : `CIDR Sweep ${scanCidrInput} completed (${parsed.estimatedHosts} IPs scanned): new agentless host ${hostLabel} (${ipLabel}) stored in database.`
+        );
+      }
+    } catch (err) {
+      setScanError(`Gagal menghubungi endpoint /api/v1/scan: ${(err as Error).message}`);
+    }
+  };
 
-    setDevices((prev) => [newDevice, ...prev]);
-    setSelectedDeviceIds((prev) => [newDevice.id, ...prev]);
+  const handleAddCredential = async (entry: CredentialVaultEntry) => {
+    setCredentials((prev) => [entry, ...prev]);
+    try {
+      await fetch(`${API_BASE}/api/v1/credentials`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(entry),
+      });
+      await fetchLiveTelemetry();
+    } catch {
+      // Keep local state if offline
+    }
+  };
 
-    setScanMessage(
-      lang === 'id'
-        ? `Sweep CIDR ${scanCidrInput} selesai (${parsed.estimatedHosts} IP dipindai dengan ${engineConfig.maxScannerGoroutines} goroutine): ditemukan host agentless baru ${newHost} (${newIp}).`
-        : `CIDR Sweep ${scanCidrInput} completed (${parsed.estimatedHosts} IPs scanned via ${engineConfig.maxScannerGoroutines} goroutines): discovered new agentless host ${newHost} (${newIp}).`
-    );
-
-    setLogs((prev) => [
-      {
-        id: `log-scan-${Date.now()}`,
-        timestamp: new Date().toTimeString().slice(0, 8) + '.112',
-        level: 'INFO',
-        module: 'SWEEPER-ICMP',
-        deviceHostname: newHost,
-        message: `Discovered host ${newIp} on ${scanCidrInput} (TCP 22/SSH open, RTT 1.5ms)`,
-        latencyMs: 1.5,
-      },
-      ...prev,
-    ]);
+  const handleDeleteCredential = async (id: string) => {
+    setCredentials((prev) => prev.filter((c) => c.id !== id));
+    try {
+      await fetch(`${API_BASE}/api/v1/credentials?id=${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      });
+      await fetchLiveTelemetry();
+    } catch {
+      // Keep local state
+    }
   };
 
   const handleRotateCredentialKey = (id: string) => {
@@ -263,20 +287,59 @@ export default function App() {
     );
   };
 
-  const handleEmitTestIngest = () => {
-    const sampleDev = devices[0];
-    setLogs((prev) => [
-      {
-        id: `log-ingest-${Date.now()}`,
-        timestamp: new Date().toTimeString().slice(0, 8) + '.804',
-        level: 'INFO',
-        module: 'INGEST-TLS',
-        deviceHostname: sampleDev.hostname,
-        message: `POST /api/v1/agent/ingest TLS 1.3 Gzip frame (1.58 KB) stored in TimescaleDB chunk`,
-        latencyMs: 1.7,
-      },
-      ...prev,
-    ]);
+  const handleEmitTestIngest = async () => {
+    const idx = devices.length + 1;
+    const hostSuffix = String(idx).padStart(2, '0');
+    const macByte = (16 + idx).toString(16).toUpperCase().padStart(2, '0');
+    const samplePayload = {
+      agent_version: 'v2.4.1-go',
+      hostname: `LOCAL-AGENT-NODE${hostSuffix}`,
+      ip_address: `10.24.10.${20 + idx}`,
+      mac_address: `00:25:90:FD:11:${macByte}`,
+      os_family: idx % 2 === 0 ? 'Windows Server' : 'Ubuntu Linux',
+      os_version: idx % 2 === 0 ? '2022 Datacenter' : '24.04.1 LTS',
+      kernel_arch: 'x86_64',
+      cpu_model: 'AMD EPYC 7763 64-Core',
+      cpu_cores: 16,
+      cpu_usage_pct: 24.5,
+      ram_total_gb: 64,
+      ram_used_gb: 21.8,
+      disk_total_gb: 1000,
+      disk_used_gb: 312.4,
+      agent_rss_mb: 11.6,
+      heartbeat_mode: 'standard',
+      interfaces: [
+        {
+          interface_name: 'eth0',
+          ip_address: `10.24.10.${20 + idx}`,
+          mac_address: `00:25:90:FD:11:${macByte}`,
+          speed_mbps: 10000,
+          vlan_id: 10,
+          rx_mbps: 142.8,
+          tx_mbps: 98.4,
+          is_primary: true,
+        },
+      ],
+      software: [
+        {
+          software_name: 'VectraNet Native Go Agent',
+          version: '2.4.1',
+          publisher: 'VectraNet SecOps',
+          install_date: new Date().toISOString().slice(0, 10),
+        },
+      ],
+    };
+
+    try {
+      await fetch(`${API_BASE}/api/v1/agent/ingest`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(samplePayload),
+      });
+      await fetchLiveTelemetry();
+    } catch {
+      // Ignore network error
+    }
   };
 
   const deployTargets = useMemo(
@@ -361,6 +424,22 @@ export default function App() {
         </nav>
 
         <div className="flex items-center gap-3 shrink-0">
+          <button
+            type="button"
+            onClick={() => void fetchLiveTelemetry()}
+            title="Poll /api/v1/devices & /api/v1/metrics (Auto-poll 5s)"
+            className="px-3 py-2 text-xs font-mono text-slate-300 hover:text-white bg-[#161F30] border border-[#1E293B] rounded-lg transition-colors flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 text-emerald-400 ${isPolling ? 'animate-spin' : ''}`} />
+            <span>
+              {apiStatus === 'connected'
+                ? `API 5s (${metrics.lastPolledAt})`
+                : apiStatus === 'syncing'
+                ? 'Syncing...'
+                : 'API Offline'}
+            </span>
+          </button>
+
           <button
             type="button"
             onClick={() =>
@@ -533,27 +612,35 @@ export default function App() {
                 <div className="font-semibold text-slate-200 pb-1 border-b border-[#1E293B]">
                   {lang === 'id' ? 'Notifikasi Real-Time' : 'Real-Time Activity Feed'}
                 </div>
-                {notifications.map((n) => (
-                  <div key={n.id} className="pb-2 border-b border-[#1E293B]/60 last:border-none">
-                    <div className="flex items-center justify-between text-[11px] text-slate-400">
-                      <span
-                        className={
-                          n.severity === 'warning'
-                            ? 'text-rose-400 font-medium'
-                            : n.severity === 'success'
-                            ? 'text-emerald-400 font-medium'
-                            : 'text-cyan-400 font-medium'
-                        }
-                      >
-                        {lang === 'id' ? n.titleId : n.titleEn}
-                      </span>
-                      <span className="font-mono">{n.timestamp}</span>
+                {notifications.length === 0 ? (
+                  <p className="text-[11px] text-slate-400 py-1">
+                    {lang === 'id'
+                      ? 'Belum ada aktivitas baru.'
+                      : 'No recent activity notifications.'}
+                  </p>
+                ) : (
+                  notifications.map((n) => (
+                    <div key={n.id} className="pb-2 border-b border-[#1E293B]/60 last:border-none">
+                      <div className="flex items-center justify-between text-[11px] text-slate-400">
+                        <span
+                          className={
+                            n.severity === 'warning'
+                              ? 'text-rose-400 font-medium'
+                              : n.severity === 'success'
+                              ? 'text-emerald-400 font-medium'
+                              : 'text-cyan-400 font-medium'
+                          }
+                        >
+                          {lang === 'id' ? n.titleId : n.titleEn}
+                        </span>
+                        <span className="font-mono">{n.timestamp}</span>
+                      </div>
+                      <p className="text-[11px] text-slate-300 mt-0.5">
+                        {lang === 'id' ? n.descId : n.descEn}
+                      </p>
                     </div>
-                    <p className="text-[11px] text-slate-300 mt-0.5">
-                      {lang === 'id' ? n.descId : n.descEn}
-                    </p>
-                  </div>
-                ))}
+                  ))
+                )}
               </div>
             )}
           </div>
@@ -634,13 +721,13 @@ export default function App() {
                     >
                       <Radar className="w-4 h-4 text-emerald-400" />
                       {lang === 'id'
-                        ? 'Pemindai Subnet IP Konkuren & Sinkronisasi Active Directory (Golang Goroutine Sweeper)'
-                        : 'Concurrent CIDR IP Sweeper & Active Directory Sync (Golang Goroutine Sweeper)'}
+                        ? 'Pemindai Subnet IP Konkuren & Sinkronisasi PostgreSQL (/api/v1/scan)'
+                        : 'Concurrent CIDR IP Sweeper & PostgreSQL Sync (/api/v1/scan)'}
                     </label>
                     <p className="text-xs text-slate-400 mb-2">
                       {lang === 'id'
-                        ? 'Memindai rentang CIDR secara paralel (ICMP + ARP + TCP Port 22/161/445/5986) untuk menemukan host tanpa agen.'
-                        : 'Concurrently sweeps CIDR subnets (ICMP + ARP + TCP 22/161/445/5986) to discover agentless endpoints.'}
+                        ? 'Memindai rentang CIDR secara paralel (ICMP + ARP + TCP Port 22/161/445/5986) atau menerima telemetri agen via /api/v1/agent/ingest.'
+                        : 'Concurrently sweeps CIDR subnets (ICMP + ARP + TCP 22/161/445/5986) or ingests live agent payloads via /api/v1/agent/ingest.'}
                     </p>
                     <div className="flex flex-col sm:flex-row gap-2.5">
                       <input
@@ -657,6 +744,14 @@ export default function App() {
                       >
                         <Radar className="w-4 h-4" />
                         {lang === 'id' ? 'Pindai Subnet Sekarang' : 'Scan Subnet Now'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleEmitTestIngest()}
+                        className="px-4 py-2 text-xs font-medium bg-[#0B0F17] hover:bg-slate-800 text-emerald-400 border border-[#1E293B] rounded-lg transition-colors flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer"
+                      >
+                        <PlusCircle className="w-4 h-4" />
+                        {lang === 'id' ? 'Uji Ingest Agen Lokal' : 'Test Local Agent Ingest'}
                       </button>
                     </div>
                   </div>
@@ -680,13 +775,13 @@ export default function App() {
                   <div>
                     <h2 className="text-base font-semibold text-white">
                       {lang === 'id'
-                        ? 'Inventaris Aset TI & Tabel Remote Push Deployment'
-                        : 'IT Asset Inventory & Remote Push Deployment Table'}
+                        ? 'Inventaris Aset TI Real-Time (Polling /api/v1/devices setiap 5 detik)'
+                        : 'Real-Time IT Asset Inventory (Polling /api/v1/devices every 5s)'}
                     </h2>
                     <p className="text-xs text-slate-400 mt-0.5">
                       {lang === 'id'
-                        ? 'Pilih host Agentless untuk menginstal agen native secara silent melalui WinRM atau SSH.'
-                        : 'Select agentless endpoints to silently push the native Go agent via WinRM or SSH.'}
+                        ? 'Terhubung ke database PostgreSQL (vectranet_rmm). Pilih host Agentless untuk menginstal agen native via WinRM atau SSH.'
+                        : 'Connected to PostgreSQL (vectranet_rmm). Select agentless endpoints to silently push the native Go agent.'}
                     </p>
                   </div>
 
@@ -767,127 +862,146 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-[#1E293B]">
-                      {filteredDevices.map((dev) => {
-                        const isChecked = selectedDeviceIds.includes(dev.id);
-                        const ramPct = Math.round(
-                          (dev.ramUsedGb / Math.max(1, dev.ramTotalGb)) * 100
-                        );
-
-                        return (
-                          <tr
-                            key={dev.id}
-                            className="hover:bg-[#0B0F17]/60 transition-colors"
-                          >
-                            <td className="py-3 px-3">
-                              <input
-                                type="checkbox"
-                                aria-label={`Select ${dev.hostname}`}
-                                checked={isChecked}
-                                onChange={() => handleToggleSelectDevice(dev.id)}
-                                className="w-3.5 h-3.5 accent-emerald-500 cursor-pointer"
-                              />
-                            </td>
-
-                            <td className="py-3 px-3">
-                              <div className="font-semibold text-slate-100">
-                                {dev.hostname}
+                      {filteredDevices.length === 0 ? (
+                        <tr>
+                          <td colSpan={7} className="py-10 px-4 text-center">
+                            <div className="max-w-lg mx-auto space-y-2">
+                              <div className="text-sm font-semibold text-slate-200">
+                                {lang === 'id'
+                                  ? 'Zero-State: Belum Ada Perangkat Terdeteksi di Database'
+                                  : 'Zero-State: No Devices Discovered in Database Yet'}
                               </div>
-                              <div className="text-[11px] text-slate-400">
-                                {dev.location} · {dev.lastSeen}
-                              </div>
-                            </td>
+                              <p className="text-xs text-slate-400 leading-relaxed">
+                                {lang === 'id'
+                                  ? 'Tabel inventaris saat ini kosong ([]). Jalankan agen Go lokal (agents/windows, agents/linux, atau agents/macos) yang mengarah ke /api/v1/agent/ingest, atau klik tombol "Pindai Subnet Sekarang" / "Uji Ingest Agen Lokal" di atas.'
+                                  : 'The inventory table is currently empty ([]). Start a local Go agent pointing to /api/v1/agent/ingest, or click "Scan Subnet Now" / "Test Local Agent Ingest" above.'}
+                              </p>
+                            </div>
+                          </td>
+                        </tr>
+                      ) : (
+                        filteredDevices.map((dev) => {
+                          const isChecked = selectedDeviceIds.includes(dev.id);
+                          const ramPct = Math.round(
+                            (dev.ramUsedGb / Math.max(1, dev.ramTotalGb)) * 100
+                          );
 
-                            <td className="py-3 px-3 font-mono tabular-nums">
-                              <div className="text-slate-200">{dev.ipAddress}</div>
-                              <div className="text-[11px] text-slate-400">
-                                {dev.macAddress}
-                              </div>
-                            </td>
+                          return (
+                            <tr
+                              key={dev.id}
+                              className="hover:bg-[#0B0F17]/60 transition-colors"
+                            >
+                              <td className="py-3 px-3">
+                                <input
+                                  type="checkbox"
+                                  aria-label={`Select ${dev.hostname}`}
+                                  checked={isChecked}
+                                  onChange={() => handleToggleSelectDevice(dev.id)}
+                                  className="w-3.5 h-3.5 accent-emerald-500 cursor-pointer"
+                                />
+                              </td>
 
-                            <td className="py-3 px-3">
-                              <div className="text-slate-200">{dev.os}</div>
-                              <div className="text-[11px] text-slate-400 font-mono">
-                                {dev.osVersion}
-                              </div>
-                            </td>
+                              <td className="py-3 px-3">
+                                <div className="font-semibold text-slate-100">
+                                  {dev.hostname}
+                                </div>
+                                <div className="text-[11px] text-slate-400">
+                                  {dev.location} · {dev.lastSeen}
+                                </div>
+                              </td>
 
-                            <td className="py-3 px-3">
-                              <div className="flex items-center gap-1.5">
-                                {dev.status === 'warning' ? (
-                                  <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
-                                ) : (
-                                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                                )}
-                                <span
+                              <td className="py-3 px-3 font-mono tabular-nums">
+                                <div className="text-slate-200">{dev.ipAddress}</div>
+                                <div className="text-[11px] text-slate-400">
+                                  {dev.macAddress}
+                                </div>
+                              </td>
+
+                              <td className="py-3 px-3">
+                                <div className="text-slate-200">{dev.os}</div>
+                                <div className="text-[11px] text-slate-400 font-mono">
+                                  {dev.osVersion}
+                                </div>
+                              </td>
+
+                              <td className="py-3 px-3">
+                                <div className="flex items-center gap-1.5">
+                                  {dev.status === 'warning' ? (
+                                    <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                                  ) : (
+                                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                                  )}
+                                  <span
+                                    className={
+                                      dev.status === 'warning'
+                                        ? 'text-rose-400 font-medium'
+                                        : 'text-emerald-400 font-medium'
+                                    }
+                                  >
+                                    {dev.status.toUpperCase()}
+                                  </span>
+                                  <span className="text-slate-500">·</span>
+                                  <span className="font-mono text-slate-300">
+                                    {dev.agentState === 'active'
+                                      ? `Agent ${dev.agentVersion} (${dev.agentMemoryMb}MB)`
+                                      : dev.agentState === 'snmp-only'
+                                      ? 'SNMPv3 Poll'
+                                      : 'Agentless'}
+                                  </span>
+                                </div>
+                              </td>
+
+                              <td className="py-3 px-3 text-right font-mono tabular-nums">
+                                <div
                                   className={
-                                    dev.status === 'warning'
-                                      ? 'text-rose-400 font-medium'
-                                      : 'text-emerald-400 font-medium'
+                                    dev.cpuUsagePct > 80
+                                      ? 'text-rose-400 font-semibold'
+                                      : 'text-slate-200'
                                   }
                                 >
-                                  {dev.status.toUpperCase()}
-                                </span>
-                                <span className="text-slate-500">·</span>
-                                <span className="font-mono text-slate-300">
-                                  {dev.agentState === 'active'
-                                    ? `Agent ${dev.agentVersion} (${dev.agentMemoryMb}MB)`
-                                    : dev.agentState === 'snmp-only'
-                                    ? 'SNMPv3 Poll'
-                                    : 'Agentless'}
-                                </span>
-                              </div>
-                            </td>
+                                  CPU {dev.cpuUsagePct}%
+                                </div>
+                                <div className="text-[11px] text-slate-400">
+                                  RAM {ramPct}% ({dev.ramUsedGb}/{dev.ramTotalGb}GB)
+                                </div>
+                              </td>
 
-                            <td className="py-3 px-3 text-right font-mono tabular-nums">
-                              <div
-                                className={
-                                  dev.cpuUsagePct > 80
-                                    ? 'text-rose-400 font-semibold'
-                                    : 'text-slate-200'
-                                }
-                              >
-                                CPU {dev.cpuUsagePct}%
-                              </div>
-                              <div className="text-[11px] text-slate-400">
-                                RAM {ramPct}% ({dev.ramUsedGb}/{dev.ramTotalGb}GB)
-                              </div>
-                            </td>
-
-                            <td className="py-3 px-3 text-right">
-                              <div className="inline-flex items-center justify-end gap-2">
-                                <button
-                                  type="button"
-                                  onClick={() => setInspectDevice(dev)}
-                                  className="px-2.5 py-1.5 text-xs font-medium text-slate-300 hover:text-white bg-[#0B0F17] border border-[#1E293B] rounded-lg transition-colors inline-flex items-center gap-1 whitespace-nowrap cursor-pointer"
-                                >
-                                  <Eye className="w-3.5 h-3.5" />
-                                  <span>Detail</span>
-                                </button>
-
-                                {dev.agentState === 'agentless' ? (
+                              <td className="py-3 px-3 text-right">
+                                <div className="inline-flex items-center justify-end gap-2">
                                   <button
                                     type="button"
-                                    onClick={() => handleOpenDeployModal([dev.id])}
-                                    className="px-3 py-1.5 text-xs font-semibold bg-emerald-500 hover:bg-emerald-400 text-slate-950 rounded-lg transition-colors inline-flex items-center gap-1 whitespace-nowrap cursor-pointer"
+                                    onClick={() => setInspectDevice(dev)}
+                                    className="px-2.5 py-1.5 text-xs font-medium text-slate-300 hover:text-white bg-[#0B0F17] border border-[#1E293B] rounded-lg transition-colors inline-flex items-center gap-1 whitespace-nowrap cursor-pointer"
                                   >
-                                    <Rocket className="w-3.5 h-3.5" />
-                                    <span>Deploy Agent</span>
+                                    <Eye className="w-3.5 h-3.5" />
+                                    <span>Detail</span>
                                   </button>
-                                ) : (
-                                  <span className="px-2.5 py-1.5 text-xs font-mono text-emerald-400 inline-flex items-center gap-1 whitespace-nowrap shrink-0">
-                                    <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
-                                    <span>
-                                      {dev.agentState === 'active'
-                                        ? 'Agent Active'
-                                        : 'SNMPv3 Synced'}
+
+                                  {dev.agentState === 'agentless' ? (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleOpenDeployModal([dev.id])}
+                                      className="px-3 py-1.5 text-xs font-semibold bg-emerald-500 hover:bg-emerald-400 text-slate-950 rounded-lg transition-colors inline-flex items-center gap-1 whitespace-nowrap cursor-pointer"
+                                    >
+                                      <Rocket className="w-3.5 h-3.5" />
+                                      <span>Deploy Agent</span>
+                                    </button>
+                                  ) : (
+                                    <span className="px-2.5 py-1.5 text-xs font-mono text-emerald-400 inline-flex items-center gap-1 whitespace-nowrap shrink-0">
+                                      <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
+                                      <span>
+                                        {dev.agentState === 'active'
+                                          ? 'Agent Active'
+                                          : 'SNMPv3 Synced'}
+                                      </span>
                                     </span>
-                                  </span>
-                                )}
-                              </div>
-                            </td>
-                          </tr>
-                        );
-                      })}
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
                     </tbody>
                   </table>
                 </div>
@@ -907,13 +1021,9 @@ export default function App() {
             <CredentialVaultView
               credentials={credentials}
               lang={lang}
-              onAddCredential={(entry) =>
-                setCredentials((prev) => [entry, ...prev])
-              }
+              onAddCredential={(entry) => void handleAddCredential(entry)}
               onRotateKey={handleRotateCredentialKey}
-              onDeleteCredential={(id) =>
-                setCredentials((prev) => prev.filter((c) => c.id !== id))
-              }
+              onDeleteCredential={(id) => void handleDeleteCredential(id)}
             />
           )}
 
@@ -921,9 +1031,10 @@ export default function App() {
             <SystemHealthLogsView
               devices={devices}
               logs={logs}
+              metrics={metrics}
               config={engineConfig}
               lang={lang}
-              onEmitTestIngest={handleEmitTestIngest}
+              onEmitTestIngest={() => void handleEmitTestIngest()}
             />
           )}
 
@@ -960,7 +1071,7 @@ export default function App() {
         credentials={credentials}
         lang={lang}
         onClose={() => setIsDeployModalOpen(false)}
-        onConfirmDeploy={handleConfirmDeploy}
+        onConfirmDeploy={(targetIds, credId) => void handleConfirmDeploy(targetIds, credId)}
       />
 
       <DeviceDetailModal
