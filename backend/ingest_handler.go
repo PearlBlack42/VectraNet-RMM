@@ -3218,54 +3218,55 @@ foreach ($c in $credCandidates) {
 
     if (Test-Path $remoteShareDir) {
       Remove-Item $remoteJsonUnc -Force -ErrorAction SilentlyContinue
-      $agentPayload = @"
-`$ErrorActionPreference = 'SilentlyContinue'
-`$cs   = Get-CimInstance Win32_ComputerSystem
-`$os   = Get-CimInstance Win32_OperatingSystem
-`$cpus = @(Get-CimInstance Win32_Processor)
-`$disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
-`$nic  = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True" | Where-Object { `$_.MACAddress })[0]
-`$mac  = if (`$nic -and `$nic.MACAddress) { (`$nic.MACAddress -replace '-',':').ToUpper() } else { '02:56:00:00:00:01' }
-`$cpuLoad = 0
-if (`$cpus.Count -gt 0) {
-  `$m = (`$cpus | Measure-Object -Property LoadPercentage -Average)
-  if (`$null -ne `$m.Average) { `$cpuLoad = [double]`$m.Average }
+      $agentPayloadTemplate = @'
+$ErrorActionPreference = 'SilentlyContinue'
+$cs   = Get-CimInstance Win32_ComputerSystem
+$os   = Get-CimInstance Win32_OperatingSystem
+$cpus = @(Get-CimInstance Win32_Processor)
+$disk = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+$nic  = @(Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True" | Where-Object { $_.MACAddress })[0]
+$mac  = if ($nic -and $nic.MACAddress) { ($nic.MACAddress -replace '-',':').ToUpper() } else { '02:56:00:00:00:01' }
+$cpuLoad = 0
+if ($cpus.Count -gt 0) {
+  $m = ($cpus | Measure-Object -Property LoadPercentage -Average)
+  if ($null -ne $m.Average) { $cpuLoad = [double]$m.Average }
 }
-`$cores = 0
-foreach (`$cpu in `$cpus) { `$cores += [int]`$cpu.NumberOfLogicalProcessors }
-if (`$cores -lt 1) { `$cores = 1 }
-`$hwSnap = [PSCustomObject]@{
-  Hostname   = [string]`$env:COMPUTERNAME
-  OSCaption  = [string]`$os.Caption
-  MemTotalKB = [double]`$os.TotalVisibleMemorySize
-  MemFreeKB  = [double]`$os.FreePhysicalMemory
-  CPUName    = [string]`$cpus[0].Name
-  CPUCores   = [int]`$cores
-  CPULoad    = [double]`$cpuLoad
-  DiskSizeB  = [double]`$disk.Size
-  DiskFreeB  = [double]`$disk.FreeSpace
+$cores = 0
+foreach ($cpu in $cpus) { $cores += [int]$cpu.NumberOfLogicalProcessors }
+if ($cores -lt 1) { $cores = 1 }
+$hwSnap = [PSCustomObject]@{
+  Hostname   = [string]$env:COMPUTERNAME
+  OSCaption  = [string]$os.Caption
+  MemTotalKB = [double]$os.TotalVisibleMemorySize
+  MemFreeKB  = [double]$os.FreePhysicalMemory
+  CPUName    = [string]$cpus[0].Name
+  CPUCores   = [int]$cores
+  CPULoad    = [double]$cpuLoad
+  DiskSizeB  = [double]$disk.Size
+  DiskFreeB  = [double]$disk.FreeSpace
   Transport  = 'SMB Share (C$\Windows\Temp) + Remote SCM Service (Port 445/135)'
 }
-`$hwSnap | ConvertTo-Json -Compress | Set-Content -Path 'C:\Windows\Temp\vectranet-hw.json' -Encoding UTF8 -Force
-`$ingestBody = @{
+$hwSnap | ConvertTo-Json -Compress | Set-Content -Path 'C:\Windows\Temp\vectranet-hw.json' -Encoding UTF8 -Force
+$ingestBody = @{
   agent_version = 'v2.4.2-smb-scm'
-  hostname      = [string]`$env:COMPUTERNAME
-  ip_address    = '$targetIp'
-  mac_address   = `$mac
+  hostname      = [string]$env:COMPUTERNAME
+  ip_address    = '__TARGET_IP__'
+  mac_address   = $mac
   os_family     = 'Windows'
-  os_version    = [string]`$os.Caption
+  os_version    = [string]$os.Caption
   kernel_arch   = 'windows/amd64'
-  cpu_model     = [string]`$cpus[0].Name
-  cpu_cores     = [int]`$cores
-  cpu_usage_pct = [math]::Round([double]`$cpuLoad, 2)
-  ram_total_gb  = [math]::Round(`$os.TotalVisibleMemorySize/1MB, 2)
-  ram_used_gb   = [math]::Round((`$os.TotalVisibleMemorySize-`$os.FreePhysicalMemory)/1MB, 2)
-  disk_total_gb = [math]::Round(`$disk.Size/1GB, 2)
-  disk_used_gb  = [math]::Round((`$disk.Size-`$disk.FreeSpace)/1GB, 2)
+  cpu_model     = [string]$cpus[0].Name
+  cpu_cores     = [int]$cores
+  cpu_usage_pct = [math]::Round([double]$cpuLoad, 2)
+  ram_total_gb  = [math]::Round($os.TotalVisibleMemorySize/1MB, 2)
+  ram_used_gb   = [math]::Round(($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)/1MB, 2)
+  disk_total_gb = [math]::Round($disk.Size/1GB, 2)
+  disk_used_gb  = [math]::Round(($disk.Size-$disk.FreeSpace)/1GB, 2)
   agent_rss_mb  = 12.4
 } | ConvertTo-Json -Compress
-try { Invoke-RestMethod -Uri '$srvOrigin/api/v1/agent/ingest' -Method Post -ContentType 'application/json' -Body `$ingestBody -TimeoutSec 6 } catch {}
-"@
+try { Invoke-RestMethod -Uri '__SRV_ORIGIN__/api/v1/agent/ingest' -Method Post -ContentType 'application/json' -Body $ingestBody -TimeoutSec 6 } catch {}
+'@
+      $agentPayload = $agentPayloadTemplate.Replace('__TARGET_IP__', $targetIp).Replace('__SRV_ORIGIN__', $srvOrigin)
       Set-Content -Path $remotePs1Unc -Value $agentPayload -Encoding UTF8 -Force
 
       # 1A. Trigger via Remote Windows Service Control Manager (SCM RPC over Port 445/135)
