@@ -92,23 +92,50 @@ export function calculateAdaptiveHeartbeat(params: {
 }
 
 /**
- * Deterministic AES-256-GCM envelope metadata generator for the Credential Vault
+ * Strictly maps each authentication protocol to its standard IANA TCP/UDP port.
+ * Never mixes WinRM-HTTPS (5986) with WinRM-HTTP (5985), SMB (445), or RPC (135).
+ */
+export function resolveStandardPortForProtocol(protocol: CredentialProtocol | string): number {
+  switch (protocol) {
+    case 'WinRM-HTTPS':
+      return 5986;
+    case 'WinRM-HTTP':
+      return 5985;
+    case 'SSH-Ed25519':
+    case 'SSH-Password':
+      return 22;
+    case 'SNMPv3-AuthPriv':
+    case 'SNMPv2c':
+      return 161;
+    case 'LDAP-AD':
+      return 636;
+    default:
+      return 5986;
+  }
+}
+
+/**
+ * Deterministic AES-256-GCM envelope metadata generator for the Credential Vault.
+ * Stores credentials universally without binding to a specific port or subnet.
  */
 export function encryptCredentialSecret(params: {
   label: string;
   protocol: CredentialProtocol;
   username: string;
   rawSecret: string;
-  port: number;
-  scopeSubnet: string;
+  port?: number;
+  scopeSubnet?: string;
 }): Omit<CredentialVaultEntry, 'id' | 'lastRotated' | 'createdBy' | 'verified'> {
   const cleanLabel = params.label.trim();
   const cleanUser = params.username.trim();
   const secret = params.rawSecret;
+  const standardPort = params.port || resolveStandardPortForProtocol(params.protocol);
+  const universalScope =
+    params.scopeSubnet && params.scopeSubnet.trim() ? params.scopeSubnet.trim() : 'Universal (Any Host)';
 
   // Deterministic hex digest simulation for envelope preview
   let hash = 0x811c9dc5;
-  const input = `${cleanLabel}:${params.protocol}:${cleanUser}:${secret}:${params.scopeSubnet}`;
+  const input = `${cleanLabel}:${params.protocol}:${cleanUser}:${secret}`;
   for (let i = 0; i < input.length; i++) {
     hash ^= input.charCodeAt(i);
     hash = Math.imul(hash, 0x01000193) >>> 0;
@@ -123,8 +150,8 @@ export function encryptCredentialSecret(params: {
     label: cleanLabel,
     protocol: params.protocol,
     username: cleanUser,
-    port: params.port,
-    scopeSubnet: params.scopeSubnet.trim(),
+    port: standardPort,
+    scopeSubnet: universalScope,
     cipherPreview: `aes256gcm$${hex1}${hex2}${hex3}...${hex4.slice(0, 4)}`,
     ivHex: `${hex2}${hex3.slice(0, 4)}`.toUpperCase(),
     authTagHex: `${hex4}${hex1}`.toUpperCase(),
@@ -136,7 +163,7 @@ export function validateCredentialForm(input: {
   label: string;
   username: string;
   rawSecret: string;
-  scopeSubnet: string;
+  scopeSubnet?: string;
 }): { valid: boolean; error?: string } {
   if (!input.label || input.label.trim().length < 2) {
     return { valid: false, error: 'Label profil kredensial wajib diisi (minimal 2 karakter)' };
@@ -147,14 +174,6 @@ export function validateCredentialForm(input: {
   // Allow short passwords (1+ chars, e.g. 3-letter local PC passwords) or empty passwordless keys
   if (typeof input.rawSecret !== 'string') {
     return { valid: false, error: 'Format Secret/Password tidak valid' };
-  }
-  const normalizedSubnet =
-    input.scopeSubnet.trim() && !input.scopeSubnet.includes('/')
-      ? `${input.scopeSubnet.trim()}/32`
-      : input.scopeSubnet.trim();
-  const cidrCheck = parseCidrRange(normalizedSubnet);
-  if (!cidrCheck.valid) {
-    return { valid: false, error: cidrCheck.error || 'Invalid CIDR subnet scope' };
   }
   return { valid: true };
 }

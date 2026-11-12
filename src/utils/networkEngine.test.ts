@@ -52,53 +52,48 @@ test('calculateAdaptiveHeartbeat adjusts interval based on CPU/RAM load and spik
   assert.equal(burst.nextIntervalSec, 10);
 });
 
-test('encryptCredentialSecret and validateCredentialForm enforce security inputs and allow short local passwords', () => {
+test('encryptCredentialSecret, validateCredentialForm, and resolveStandardPortForProtocol support universal credentials and strict port mapping', () => {
   const bad = validateCredentialForm({
     label: 'A',
     username: 'admin',
     rawSecret: '123',
-    scopeSubnet: '10.24.10.0/24',
   });
   assert.equal(bad.valid, false);
 
-  // Short 3-character password (e.g. local PC password) must pass without error
+  // Universal credential with short 3-character password (no port or CIDR required)
   const shortLocalPass = validateCredentialForm({
     label: 'PC Lokal Windows',
-    username: 'UserPC',
+    username: 'edp07',
     rawSecret: 'abc',
-    scopeSubnet: '192.168.1.0/24',
   });
   assert.equal(shortLocalPass.valid, true);
 
   const encryptedShort = encryptCredentialSecret({
     label: 'PC Lokal Windows',
     protocol: 'WinRM-HTTPS',
-    username: 'UserPC',
+    username: 'edp07',
     rawSecret: 'abc',
-    port: 5986,
-    scopeSubnet: '192.168.1.0/24',
   });
+  assert.equal(encryptedShort.port, 5986);
+  assert.equal(encryptedShort.scopeSubnet, 'Universal (Any Host)');
   assert.ok(encryptedShort.cipherPreview.startsWith('aes256gcm$'));
   assert.ok(encryptedShort.keyFingerprint.startsWith('SHA256:'));
 
-  const good = validateCredentialForm({
-    label: 'Prod WinRM Domain Admin',
-    username: 'CORP\\svc_rmm_deploy',
-    rawSecret: 'Str0ngP@ssw0rd!2026',
-    scopeSubnet: '10.24.10.0/24',
+  const encryptedWinRMHttp = encryptCredentialSecret({
+    label: 'PC Workgroup HTTP',
+    protocol: 'WinRM-HTTP',
+    username: 'edp07',
+    rawSecret: 'abc',
   });
-  assert.equal(good.valid, true);
+  assert.equal(encryptedWinRMHttp.port, 5985);
 
-  const encrypted = encryptCredentialSecret({
-    label: 'Prod WinRM Domain Admin',
-    protocol: 'WinRM-HTTPS',
-    username: 'CORP\\svc_rmm_deploy',
-    rawSecret: 'Str0ngP@ssw0rd!2026',
-    port: 5986,
-    scopeSubnet: '10.24.10.0/24',
+  const encryptedSsh = encryptCredentialSecret({
+    label: 'Ubuntu Root SSH',
+    protocol: 'SSH-Ed25519',
+    username: 'root',
+    rawSecret: 'ssh-ed25519 AAAA...',
   });
-  assert.ok(encrypted.cipherPreview.startsWith('aes256gcm$'));
-  assert.ok(encrypted.keyFingerprint.startsWith('SHA256:'));
+  assert.equal(encryptedSsh.port, 22);
 });
 
 test('filterDevices and applyAgentDeployment transition agentless endpoints to active', () => {

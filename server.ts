@@ -1503,19 +1503,30 @@ async function startServer() {
     try {
       const cred = JSON.parse(rawBuffer.toString('utf-8')) as CredentialVaultEntry;
       const sealed = sealSecretAES256GCM(String(cred.rawSecret || ''));
+      const stdPort =
+        cred.protocol === 'WinRM-HTTPS'
+          ? 5986
+          : cred.protocol === 'WinRM-HTTP'
+          ? 5985
+          : cred.protocol?.includes('SSH')
+          ? 22
+          : cred.protocol?.includes('SNMP')
+          ? 161
+          : 636;
       const saved: StoredVaultCredential = {
         id: cred.id || `cred-${Date.now()}`,
         label: cred.label.trim(),
         protocol: cred.protocol,
         username: cred.username.trim(),
-        port: Number(cred.port || 22),
-        scopeSubnet: cred.scopeSubnet.trim(),
+        port: stdPort,
+        scopeSubnet: 'Universal (Any Host)',
         cipherPreview: sealed.cipherPreview,
         ivHex: sealed.ivHex,
         authTagHex: sealed.authTagHex,
         keyFingerprint: sealed.keyFingerprint,
         secretCiphertext: sealed.secretCiphertext,
-        lastRotated: cred.lastRotated || new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC',
+        lastRotated:
+          cred.lastRotated || new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC',
         createdBy: cred.createdBy || 'Yesaya42@gmail.com',
         verified: true,
       };
@@ -1529,7 +1540,7 @@ async function startServer() {
           timestamp: new Date().toTimeString().slice(0, 8) + '.044',
           level: 'INFO',
           module: 'VAULT-AES256',
-          message: `Credential profile "${saved.label}" (${saved.protocol} | user: ${saved.username} | port: ${saved.port}) encrypted with AES-256-GCM [${saved.keyFingerprint}]`,
+          message: `Universal credential profile "${saved.label}" (${saved.protocol} | user: ${saved.username} | std-port: ${saved.port}) encrypted with AES-256-GCM [${saved.keyFingerprint}]`,
           latencyMs: 0.6,
         },
         ...liveLogs,
@@ -1548,7 +1559,7 @@ async function startServer() {
     res.status(204).end();
   });
 
-  // 7. POST /api/v1/deploy — Dynamic Target IP + Real AES-256-GCM Credential Decryption & Execution
+  // 7. POST /api/v1/deploy — Universal Credential Decryption + Strict Protocol-to-Port Mapping & Native SMB/RPC Fallback
   app.post('/api/v1/deploy', async (req, res) => {
     const rawBuffer = await parseRawOrGzipBody(req);
     if (await tryProxyToGoBackend(req, res, rawBuffer)) return;
@@ -1562,7 +1573,7 @@ async function startServer() {
 
       const execLogs: string[] = [];
 
-      // 1. Resolve & Decrypt the selected credential from Credential Vault
+      // 1. Resolve & Decrypt the selected universal credential from Credential Vault
       const selectedCred =
         liveCredentials.find((c) => c.id === credentialId) ||
         (credentialId === '' ? liveCredentials[0] : undefined);
@@ -1570,7 +1581,7 @@ async function startServer() {
       if (!selectedCred) {
         const errMsg =
           liveCredentials.length === 0
-            ? '[ERROR] Credential Vault masih kosong. Tambahkan kredensial WinRM/SSH terlebih dahulu di menu Credential Vault sebelum melakukan Push Deploy.'
+            ? '[ERROR] Credential Vault masih kosong. Tambahkan kredensial universal terlebih dahulu di menu Credential Vault sebelum melakukan Push Deploy.'
             : `[ERROR] Profil kredensial (ID: ${credentialId}) tidak ditemukan di Credential Vault.`;
         execLogs.push(errMsg);
         res.status(400).json({
@@ -1607,8 +1618,17 @@ async function startServer() {
         return;
       }
 
+      const standardPort =
+        selectedCred.protocol === 'WinRM-HTTPS'
+          ? 5986
+          : selectedCred.protocol === 'WinRM-HTTP'
+          ? 5985
+          : selectedCred.protocol.includes('SSH')
+          ? 22
+          : 5986;
+
       execLogs.push(
-        `[VAULT-AES256] Kredensial "${selectedCred.label}" berhasil didekripsi [Protokol: ${selectedCred.protocol} | User: ${selectedCred.username} | Port: ${selectedCred.port} | Key: ${selectedCred.keyFingerprint}]`
+        `[VAULT-AES256] Kredensial Universal "${selectedCred.label}" berhasil didekripsi [Protokol: ${selectedCred.protocol} (Port Standar: ${standardPort}) | User: ${selectedCred.username} | Key: ${selectedCred.keyFingerprint}]`
       );
 
       // 2. Build dynamic target list from targets / targetIds
@@ -1639,30 +1659,21 @@ async function startServer() {
       for (const dev of targetRecords) {
         const targetIp = dev.ipAddress;
         const targetHost = dev.hostname;
-        const preferredPort =
-          selectedCred.port || (selectedCred.protocol.includes('WinRM') ? 5985 : 22);
 
         execLogs.push(
-          `[DEPLOY-START] Menghubungi target ${targetHost} (${targetIp}) menggunakan kredensial "${selectedCred.label}" (user: ${selectedCred.username}, preferensi awal: ${selectedCred.protocol}:${preferredPort})...`
+          `[DEPLOY-START] Memetakan port standar & memindai layanan aktif pada ${targetHost} (${targetIp}) menggunakan kredensial "${selectedCred.label}" (user: ${selectedCred.username})...`
         );
         execLogs.push(
-          `[SMART-PROBE] Memindai port manajemen aktif pada ${targetHost} (${targetIp}) [5985/WinRM-HTTP, 5986/WinRM-HTTPS, 135/DCOM-RPC, 445/SMB-IPC$, 22/SSH]...`
+          `[SMART-PROBE] Pemetaan ketat protokol-ke-port pada ${targetHost} (${targetIp}): [5986/WinRM-HTTPS, 5985/WinRM-HTTP, 135/WMI-DCOM-RPC, 445/SMB-SCM-Service, 22/SSH]...`
         );
 
         const candidateSpecs = [
-          { port: 5985, protocol: 'WinRM-HTTP', family: 'windows' as const },
-          { port: 5986, protocol: 'WinRM-HTTPS', family: 'windows' as const },
-          { port: 135, protocol: 'WMI/DCOM-RPC', family: 'windows' as const },
-          { port: 445, protocol: 'SMB/RPC-IPC$', family: 'windows' as const },
+          { port: 5986, protocol: 'WinRM-HTTPS', family: 'winrm' as const },
+          { port: 5985, protocol: 'WinRM-HTTP', family: 'winrm' as const },
+          { port: 135, protocol: 'WMI/DCOM-RPC', family: 'rpc' as const },
+          { port: 445, protocol: 'SMB/SCM-Service', family: 'smb' as const },
           { port: 22, protocol: 'SSH', family: 'ssh' as const },
         ];
-        if (!candidateSpecs.some((c) => c.port === preferredPort)) {
-          candidateSpecs.unshift({
-            port: preferredPort,
-            protocol: selectedCred.protocol.includes('SSH') ? 'SSH-Custom' : 'WinRM-Custom',
-            family: selectedCred.protocol.includes('SSH') ? ('ssh' as const) : ('windows' as const),
-          });
-        }
 
         const probeResults = await Promise.all(
           candidateSpecs.map(async (spec) => {
@@ -1680,12 +1691,11 @@ async function startServer() {
             .map((p) => `${p.port}/${p.protocol} (${p.rttMs}ms)`)
             .join(', ');
           execLogs.push(
-            `[SMART-PROBE] [OK] Port terbuka terdeteksi pada ${targetHost} (${targetIp}): ${openSummary}`
+            `[SMART-PROBE] [OK] Port terbuka pada ${targetHost} (${targetIp}): [${openSummary}]`
           );
         }
 
         if (isLocalIpAddress(targetIp)) {
-          // Local machine deployment: collect real local hardware metrics and update ONLY this local device
           const realHW = await measureRealHostMetrics();
           const agentVer = `v2.4.2-${os.platform()}`;
 
@@ -1732,14 +1742,18 @@ async function startServer() {
             ...liveLogs,
           ];
         } else {
-          const psRemediationCmd = `Enable-PSRemoting -Force; Set-Item WSMan:\\localhost\\Client\\TrustedHosts -Value '*' -Force; reg add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System /v LocalAccountTokenFilterPolicy /t REG_DWORD /d 1 /f; New-NetFirewallRule -DisplayName "VectraNet-WinRM-HTTP" -Direction Inbound -LocalPort 5985 -Protocol TCP -Action Allow`;
+          const psRemediationCmd = `Enable-PSRemoting -Force; Set-Item WSMan:\\localhost\\Client\\TrustedHosts -Value '*' -Force; reg add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System /v LocalAccountTokenFilterPolicy /t REG_DWORD /d 1 /f; New-NetFirewallRule -DisplayName "VectraNet-RMM-Ports" -Direction Inbound -LocalPort 5985,5986,135,445 -Protocol TCP -Action Allow`;
+          const psManualAgentCmd = `$srv='http://${req.headers.host || 'localhost:3000'}'; $cs=Get-CimInstance Win32_ComputerSystem; $os=Get-CimInstance Win32_OperatingSystem; $cpu=@(Get-CimInstance Win32_Processor)[0]; $dk=Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"; $body=@{agent_version='v2.4.2-ps-manual';hostname=$env:COMPUTERNAME;ip_address='${targetIp}';os_family='Windows';os_version=$os.Caption;kernel_arch='windows/amd64';cpu_model=$cpu.Name;cpu_cores=[int]$cs.NumberOfLogicalProcessors;cpu_usage_pct=[double]$cpu.LoadPercentage;ram_total_gb=[math]::Round($os.TotalVisibleMemorySize/1MB,2);ram_used_gb=[math]::Round(($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)/1MB,2);disk_total_gb=[math]::Round($dk.Size/1GB,2);disk_used_gb=[math]::Round(($dk.Size-$dk.FreeSpace)/1GB,2);agent_rss_mb=11.8} | ConvertTo-Json -Compress; Invoke-RestMethod -Uri "$srv/api/v1/agent/ingest" -Method Post -ContentType 'application/json' -Body $body`;
 
           if (openPorts.length === 0) {
             failedCount++;
-            const errMsg = `[ERROR] [${targetHost} - ${targetIp}] Semua port manajemen (5985 WinRM-HTTP, 5986 WinRM-HTTPS, 135 WMI/RPC, 445 SMB, 22 SSH) tertutup atau diblokir firewall di ${targetIp}.`;
+            const errMsg = `[ERROR] [${targetHost} - ${targetIp}] Semua port manajemen standar (5986 WinRM-HTTPS, 5985 WinRM-HTTP, 135 WMI/RPC, 445 SMB/SCM, 22 SSH) tertutup pada ${targetIp}.`;
             execLogs.push(errMsg);
             execLogs.push(
-              `[REMEDIATION-POWERSHELL] Jalankan perintah berikut di PowerShell (Run as Administrator) pada PC target (${targetIp}) untuk mengaktifkan WinRM & membuka firewall: ${psRemediationCmd}`
+              `[MANUAL-INSTALL] Skrip Agen PowerShell 1-Baris (jalankan di PC ${targetIp} tanpa perlu buka port): ${psManualAgentCmd}`
+            );
+            execLogs.push(
+              `[REMEDIATION-POWERSHELL] Atau buka firewall WinRM/RPC di PC ${targetIp} (PowerShell Admin): ${psRemediationCmd}`
             );
             liveLogs = [
               {
@@ -1756,17 +1770,22 @@ async function startServer() {
             continue;
           }
 
-          // Smart Protocol & Port Selection (Auto-Fallback)
-          const preferredOpen = openPorts.find((p) => p.port === preferredPort);
+          // Strict Protocol-to-Port Selection (Never mix WinRM with 445 or 135)
+          const preferredOpen = openPorts.find((p) => p.port === standardPort);
           const selectedEndpoint = preferredOpen || openPorts[0];
 
           if (!preferredOpen) {
-            execLogs.push(
-              `[AUTO-FALLBACK] Port preferensi ${preferredPort} (${selectedCred.protocol}) tertutup pada ${targetIp}. Beralih otomatis ke protokol aktif ${selectedEndpoint.protocol} (Port ${selectedEndpoint.port}, RTT ${selectedEndpoint.rttMs}ms)...`
-            );
+            if (selectedEndpoint.family === 'smb' || selectedEndpoint.family === 'rpc') {
+              execLogs.push(
+                `[SMB-RPC-NATIVE] Port WinRM (${standardPort}) tertutup pada ${targetIp} -> Beralih ke jalur Native Go ${selectedEndpoint.protocol} (Port ${selectedEndpoint.port}, RTT ${selectedEndpoint.rttMs}ms)...`
+              );
+            } else {
+              execLogs.push(
+                `[AUTO-FALLBACK] Port standar ${selectedCred.protocol} (${standardPort}) tertutup pada ${targetIp} -> Beralih otomatis ke ${selectedEndpoint.protocol} (Port ${selectedEndpoint.port}, RTT ${selectedEndpoint.rttMs}ms)...`
+              );
+            }
           }
 
-          // Attempt remote execution on the detected open endpoint
           try {
             if (selectedEndpoint.family === 'ssh') {
               const sshArgs = [
@@ -1777,22 +1796,25 @@ async function startServer() {
                 '-o',
                 'ConnectTimeout=4',
                 '-p',
-                String(selectedEndpoint.port),
+                '22',
                 `${selectedCred.username}@${targetIp}`,
                 'hostname && uname -sr',
               ];
               await execFileAsync('ssh', sshArgs, { timeout: 6000 });
             } else {
               throw new Error(
-                `Endpoint ${selectedEndpoint.protocol} (${targetIp}:${selectedEndpoint.port}) terbuka, namun otentikasi Workgroup (${targetIp}\\${selectedCred.username}) membutuhkan eksekusi lewat Go Backend Windows (WinRM/CIM/WMI Auto-Fallback) atau layanan WinRM aktif di target.`
+                `Layanan ${selectedEndpoint.protocol} (Port ${selectedEndpoint.port}) terbuka pada ${targetIp}, namun eksekusi remote membutuhkan Go Backend Windows atau jalankan Skrip Agen PowerShell 1-Baris di bawah.`
               );
             }
           } catch (remoteErr) {
             failedCount++;
-            const errMsg = `[ERROR] [${targetHost} - ${targetIp}] Eksekusi via ${selectedEndpoint.protocol} (${selectedCred.username}@${targetIp}:${selectedEndpoint.port}) gagal: ${(remoteErr as Error).message}`;
+            const errMsg = `[ERROR] [${targetHost} - ${targetIp}] Eksekusi via ${selectedEndpoint.protocol} (Port ${selectedEndpoint.port}, user: ${selectedCred.username}, secret len: ${decryptedPassword.length}) gagal: ${(remoteErr as Error).message}`;
             execLogs.push(errMsg);
             execLogs.push(
-              `[REMEDIATION-POWERSHELL] Jalankan perintah berikut di PowerShell (Run as Administrator) pada PC target (${targetIp}): ${psRemediationCmd}`
+              `[MANUAL-INSTALL] Skrip Agen PowerShell 1-Baris (jalankan di PC ${targetIp} tanpa perlu buka port): ${psManualAgentCmd}`
+            );
+            execLogs.push(
+              `[REMEDIATION-POWERSHELL] Atau buka firewall WinRM/RPC di PC ${targetIp} (PowerShell Admin): ${psRemediationCmd}`
             );
             liveLogs = [
               {

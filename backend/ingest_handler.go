@@ -426,8 +426,8 @@ func ensureSchema(ctx context.Context, db *pgxpool.Pool) error {
 		protocol          VARCHAR(32) NOT NULL,
 		username          VARCHAR(128) NOT NULL,
 		secret_ciphertext TEXT NOT NULL DEFAULT '',
-		port              INTEGER NOT NULL DEFAULT 22,
-		scope_subnet      VARCHAR(48) NOT NULL DEFAULT '10.24.10.0/24',
+		port              INTEGER NOT NULL DEFAULT 5986,
+		scope_subnet      VARCHAR(48) NOT NULL DEFAULT 'Universal (Any Host)',
 		cipher_preview    TEXT NOT NULL,
 		iv_hex            VARCHAR(64) NOT NULL,
 		auth_tag_hex      VARCHAR(64) NOT NULL,
@@ -439,6 +439,7 @@ func ensureSchema(ctx context.Context, db *pgxpool.Pool) error {
 	);
 
 	ALTER TABLE credential_vault ADD COLUMN IF NOT EXISTS secret_ciphertext TEXT NOT NULL DEFAULT '';
+	ALTER TABLE credential_vault ALTER COLUMN scope_subnet SET DEFAULT 'Universal (Any Host)';
 
 	CREATE TABLE IF NOT EXISTS system_logs (
 		id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -2707,6 +2708,31 @@ func fingerprintOSAndRole(openPorts []int) (osFamily, osVersion, role string) {
 // 11. CREDENTIAL VAULT (REAL AES-256-GCM) & DYNAMIC REMOTE AGENT PUSH ENGINE
 // ============================================================================
 
+// resolveStandardProtocolPort strictly maps each authentication protocol to its official IANA port.
+// Never mixes WinRM-HTTPS (5986) with WinRM-HTTP (5985), SMB (445), RPC (135), or SSH (22).
+func resolveStandardProtocolPort(protocol string) int {
+	switch strings.TrimSpace(protocol) {
+	case "WinRM-HTTPS":
+		return 5986
+	case "WinRM-HTTP":
+		return 5985
+	case "SSH-Ed25519", "SSH-Password":
+		return 22
+	case "SNMPv3-AuthPriv", "SNMPv2c":
+		return 161
+	case "LDAP-AD":
+		return 636
+	default:
+		if strings.Contains(strings.ToLower(protocol), "ssh") {
+			return 22
+		}
+		if strings.Contains(strings.ToLower(protocol), "http") && !strings.Contains(strings.ToLower(protocol), "https") {
+			return 5985
+		}
+		return 5986
+	}
+}
+
 func (s *VectraNetServer) handleCredentials(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
@@ -2731,6 +2757,8 @@ func (s *VectraNetServer) handleCredentials(w http.ResponseWriter, r *http.Reque
 				&c.ID, &c.Label, &c.Protocol, &c.Username, &c.Port, &c.ScopeSubnet,
 				&c.CipherPreview, &c.IvHex, &c.AuthTagHex, &c.KeyFingerprint, &c.LastRotated, &c.CreatedBy, &c.Verified,
 			); err == nil {
+				c.Port = resolveStandardProtocolPort(c.Protocol)
+				c.ScopeSubnet = "Universal (Any Host)"
 				creds = append(creds, c)
 			}
 		}
@@ -2743,6 +2771,10 @@ func (s *VectraNetServer) handleCredentials(w http.ResponseWriter, r *http.Reque
 			http.Error(w, `{"error":"invalid credential payload"}`, http.StatusBadRequest)
 			return
 		}
+
+		// Store credential universally: map standard port from protocol & mark scope as Universal
+		c.Port = resolveStandardProtocolPort(c.Protocol)
+		c.ScopeSubnet = "Universal (Any Host)"
 
 		// Encrypt rawSecret with real AES-256-GCM using server Master KEK
 		cipherHex, ivHex, tagHex, preview, fp, encErr := sealCredentialSecretAES256GCM(c.RawSecret, s.masterKey)
@@ -2790,7 +2822,7 @@ func (s *VectraNetServer) handleCredentials(w http.ResponseWriter, r *http.Reque
 		_, _ = s.dbPool.Exec(ctx, `
 			INSERT INTO system_logs (level, module, message, latency_ms)
 			VALUES ('INFO', 'VAULT-AES256', $1, 0.8)
-		`, fmt.Sprintf("Credential profile '%s' (%s | user: %s | port: %d) encrypted with AES-256-GCM [%s]", c.Label, c.Protocol, c.Username, c.Port, c.KeyFingerprint))
+		`, fmt.Sprintf("Universal credential profile '%s' (%s | user: %s | std-port: %d) encrypted with AES-256-GCM [%s]", c.Label, c.Protocol, c.Username, c.Port, c.KeyFingerprint))
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
@@ -2808,38 +2840,32 @@ func (s *VectraNetServer) handleCredentials(w http.ResponseWriter, r *http.Reque
 	}
 }
 
-// ManagementPortInfo describes a probed management port on the target host.
+// ManagementPortInfo describes a strictly mapped management port on the target host.
 type ManagementPortInfo struct {
-	Port     int
-	Label    string
-	Open     bool
-	Latency  float64
+	Port    int
+	Label   string
+	Open    bool
+	Latency float64
 }
 
-// probeTargetManagementPorts concurrently probes all candidate management ports on targetIP
-// (preferredPort, 5985 WinRM-HTTP, 5986 WinRM-HTTPS, 135 WMI/DCOM-RPC, 445 SMB/IPC$, 22 SSH)
-// so Push Deploy can automatically fall back to whichever port/protocol is active on the target.
-func probeTargetManagementPorts(targetIP string, preferredPort int) ([]ManagementPortInfo, map[int]bool) {
+// probeTargetManagementPorts concurrently probes standard management ports on targetIP
+// using strict protocol-to-port mapping (never mixing WinRM-HTTPS with 445 or 135):
+//   - Port 5986 -> WinRM-HTTPS (TLS WSMan)
+//   - Port 5985 -> WinRM-HTTP  (HTTP WSMan)
+//   - Port 135  -> WMI/DCOM-RPC (DCE/RPC Endpoint Mapper)
+//   - Port 445  -> SMB/SCM-Service (Native Go SMB2/IPC$ + Windows Service Control Manager)
+//   - Port 22   -> SSH (OpenSSH)
+func probeTargetManagementPorts(targetIP string) ([]ManagementPortInfo, map[int]bool) {
 	type portDef struct {
 		port  int
 		label string
 	}
 	defs := []portDef{
-		{5985, "WinRM-HTTP"},
 		{5986, "WinRM-HTTPS"},
+		{5985, "WinRM-HTTP"},
 		{135, "WMI/DCOM-RPC"},
-		{445, "SMB/RPC-IPC$"},
+		{445, "SMB/SCM-Service"},
 		{22, "SSH"},
-	}
-	hasPreferred := false
-	for _, d := range defs {
-		if d.port == preferredPort {
-			hasPreferred = true
-			break
-		}
-	}
-	if preferredPort > 0 && !hasPreferred {
-		defs = append([]portDef{{preferredPort, "Custom-Port"}}, defs...)
 	}
 
 	results := make([]ManagementPortInfo, len(defs))
@@ -2871,7 +2897,7 @@ func probeTargetManagementPorts(targetIP string, preferredPort int) ([]Managemen
 	return results, openMap
 }
 
-// buildPowerShellRemediationGuide returns a concise, copyable PowerShell command for enabling
+// buildPowerShellRemediationGuide returns a copyable PowerShell command for enabling
 // WinRM, WMI/DCOM, and Workgroup LocalAccountTokenFilterPolicy on the target Windows machine.
 func buildPowerShellRemediationGuide(targetIP string) string {
 	return fmt.Sprintf(
@@ -2880,47 +2906,248 @@ func buildPowerShellRemediationGuide(targetIP string) string {
 	)
 }
 
-// executeRemoteWindowsProbeAndDeploy connects to targetIP using the decrypted credential via an intelligent
-// multi-transport fallback chain:
-//   1. WinRM-HTTP (Port 5985) with automatic TrustedHosts & Workgroup .\username / targetIP\username support
-//   2. WinRM-HTTPS (Port 5986) with SkipCACheck / SkipCNCheck
-//   3. CIM over DCOM / RPC (Port 135) — works even when WinRM service is disabled on the target PC!
-//   4. Legacy WMI / SMB IPC$ + WMIC (Port 135 / 445)
-func executeRemoteWindowsProbeAndDeploy(ctx context.Context, targetIP string, preferredPort int, openMap map[int]bool, username, password, serverOrigin string) (RealHardwareSnapshot, string, error) {
-	hasWinPort := openMap[5985] || openMap[5986] || openMap[135] || openMap[445] || (preferredPort > 0 && openMap[preferredPort])
-	if !hasWinPort {
-		return RealHardwareSnapshot{}, "", fmt.Errorf(
-			"tidak ada port manajemen Windows (5985 WinRM-HTTP, 5986 WinRM-HTTPS, 135 WMI/RPC, 445 SMB) yang terbuka pada %s",
-			targetIP,
-		)
+// buildManualPowerShellAgentOneLiner returns a single-line PowerShell command that can be executed
+// directly on the target Windows PC to read real CPU/RAM/Disk hardware metrics and push them
+// to /api/v1/agent/ingest when incoming ports on the target are blocked by firewall.
+func buildManualPowerShellAgentOneLiner(serverOrigin, targetIP string) string {
+	return fmt.Sprintf(
+		`$srv='%s'; $cs=Get-CimInstance Win32_ComputerSystem; $os=Get-CimInstance Win32_OperatingSystem; $cpu=@(Get-CimInstance Win32_Processor)[0]; $dk=Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"; $body=@{agent_version='v2.4.2-ps-manual';hostname=$env:COMPUTERNAME;ip_address='%s';os_family='Windows';os_version=$os.Caption;kernel_arch='windows/amd64';cpu_model=$cpu.Name;cpu_cores=[int]$cs.NumberOfLogicalProcessors;cpu_usage_pct=[double]$cpu.LoadPercentage;ram_total_gb=[math]::Round($os.TotalVisibleMemorySize/1MB,2);ram_used_gb=[math]::Round(($os.TotalVisibleMemorySize-$os.FreePhysicalMemory)/1MB,2);disk_total_gb=[math]::Round($dk.Size/1GB,2);disk_used_gb=[math]::Round(($dk.Size-$dk.FreeSpace)/1GB,2);agent_rss_mb=11.8} | ConvertTo-Json -Compress; Invoke-RestMethod -Uri "$srv/api/v1/agent/ingest" -Method Post -ContentType 'application/json' -Body $body`,
+		serverOrigin, targetIP,
+	)
+}
+
+// executeNativeGoSMBRPCServiceDeploy executes a Native Go SMB2 (Port 445) + DCE/RPC Endpoint Mapper (Port 135)
+// handshake and Windows IPC$/SCM Service & WMI probe. It strictly uses Port 445 for SMB2/IPC$ and Port 135 for RPC,
+// never mixing HTTP/HTTPS WinRM onto Port 445.
+func executeNativeGoSMBRPCServiceDeploy(ctx context.Context, targetIP, username, password string, open135, open445 bool) (RealHardwareSnapshot, string, error) {
+	// Step 1: Native Go SMB2 Negotiate + NTLMSSP Challenge on TCP Port 445 to verify SMB service and extract NetBIOS/DNS Computer Name
+	var smbResolvedHost string
+	if open445 {
+		if nbName := querySMB2NTLMTargetName(targetIP, 1200*time.Millisecond); nbName != "" {
+			smbResolvedHost = nbName
+		}
+	}
+
+	// Step 2: Native Go DCE/RPC Bind Probe on TCP Port 135 (Endpoint Mapper UUID e1af8308-5d1f-11c9-91a4-08002b14a0fa)
+	rpcEndpointAlive := false
+	if open135 {
+		if conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:135", targetIP), 1200*time.Millisecond); err == nil {
+			_ = conn.SetDeadline(time.Now().Add(1200 * time.Millisecond))
+			// Standard 72-byte DCE/RPC v5.0 Bind PDU for IObjectExporter / Endpoint Mapper
+			dceBindPDU := []byte{
+				0x05, 0x00, 0x0b, 0x03, 0x10, 0x00, 0x00, 0x00,
+				0x48, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+				0xb8, 0x10, 0xb8, 0x10, 0x00, 0x00, 0x00, 0x00,
+				0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+				0xc4, 0xfe, 0xfc, 0x99, 0x60, 0x52, 0x1b, 0x10,
+				0xbb, 0xcb, 0x00, 0xaa, 0x00, 0x21, 0x34, 0x7a,
+				0x00, 0x00, 0x00, 0x00, 0x04, 0x5d, 0x88, 0x8a,
+				0xeb, 0x1c, 0xc9, 0x11, 0x9f, 0xe8, 0x08, 0x00,
+				0x2b, 0x10, 0x48, 0x60, 0x02, 0x00, 0x00, 0x00,
+			}
+			_, _ = conn.Write(dceBindPDU)
+			resp := make([]byte, 64)
+			if n, rErr := conn.Read(resp); rErr == nil && n >= 4 && resp[0] == 0x05 && resp[2] == 0x0c {
+				// 0x0c = MSRPC_BIND_ACK
+				rpcEndpointAlive = true
+			}
+			_ = conn.Close()
+		}
 	}
 
 	if runtime.GOOS != "windows" {
+		hostInfo := firstNonEmpty(smbResolvedHost, targetIP)
 		return RealHardwareSnapshot{}, "", fmt.Errorf(
-			"port manajemen Windows terbuka di %s, namun eksekusi WinRM/CIM/DCOM membutuhkan server pusat di Windows atau layanan OpenSSH (Port 22) aktif di target %s",
-			targetIP, targetIP,
+			"Native Go SMB2 (445=%v) & DCE/RPC BindAck (135=%v) merespons pada %s (%s), namun eksekusi SCM/WMI membutuhkan backend di OS Windows atau jalankan skrip PowerShell 1-baris di target",
+			open445, rpcEndpointAlive, hostInfo, targetIP,
 		)
 	}
 
-	cmdCtx, cancel := context.WithTimeout(ctx, 18*time.Second)
+	cmdCtx, cancel := context.WithTimeout(ctx, 14*time.Second)
 	defer cancel()
 
-	// PowerShell multi-transport auto-fallback script:
-	// - Automatically adds targetIP to local WinRM TrustedHosts so Workgroup IP connections succeed
-	// - Tries both 'targetIP\username' (Workgroup local account) and raw 'username' (Domain/UPN)
-	// - Automatically falls back across: WinRM-HTTP (5985) -> WinRM-HTTPS (5986) -> CIM-DCOM (135) -> WMI RPC (135/445)
-	psScript := `
+	// Native Windows IPC$ Session + RPC/SCM/WMI Execution over Port 445 & 135
+	smbRpcScript := `
 $ErrorActionPreference = 'Stop'
 $targetIp = $env:VECTRANET_TARGET_IP
 $rawUser  = $env:VECTRANET_CRED_USER
 $pass     = $env:VECTRANET_CRED_PASS
-$srvUrl   = $env:VECTRANET_SRV_URL
-$open5985 = ($env:VECTRANET_OPEN_5985 -eq '1')
-$open5986 = ($env:VECTRANET_OPEN_5986 -eq '1')
-$open135  = ($env:VECTRANET_OPEN_135  -eq '1')
-$open445  = ($env:VECTRANET_OPEN_445  -eq '1')
 
-# 1. Ensure local WinRM client trusts target IP for Workgroup NTLM negotiation
+if ([string]::IsNullOrWhiteSpace($pass)) {
+  $secPass = New-Object System.Security.SecureString
+} else {
+  $secPass = ConvertTo-SecureString $pass -AsPlainText -Force
+}
+
+$credCandidates = @()
+if ($rawUser -notmatch '[\\@]') {
+  $credCandidates += New-Object System.Management.Automation.PSCredential ("$targetIp\$rawUser", $secPass)
+  $credCandidates += New-Object System.Management.Automation.PSCredential (".\$rawUser", $secPass)
+}
+$credCandidates += New-Object System.Management.Automation.PSCredential ($rawUser, $secPass)
+
+$errList = @()
+
+# 1. Try DCOM/RPC Session on Port 135
+foreach ($c in $credCandidates) {
+  try {
+    $dcomOpt = New-CimSessionOption -Protocol Dcom
+    $sess = New-CimSession -ComputerName $targetIp -Credential $c -SessionOption $dcomOpt -OperationTimeoutSec 6 -ErrorAction Stop
+    $cs   = Get-CimInstance -CimSession $sess -ClassName Win32_ComputerSystem -Property Name -ErrorAction Stop
+    $os   = Get-CimInstance -CimSession $sess -ClassName Win32_OperatingSystem -Property Caption,TotalVisibleMemorySize,FreePhysicalMemory -ErrorAction Stop
+    $cpus = @(Get-CimInstance -CimSession $sess -ClassName Win32_Processor -Property Name,NumberOfLogicalProcessors,LoadPercentage -ErrorAction Stop)
+    $disk = Get-CimInstance -CimSession $sess -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'" -Property Size,FreeSpace -ErrorAction SilentlyContinue
+    Remove-CimSession $sess -ErrorAction SilentlyContinue
+    $cpuLoadVal = 0
+    if ($cpus.Count -gt 0) {
+      $m = ($cpus | Measure-Object -Property LoadPercentage -Average)
+      if ($null -ne $m.Average) { $cpuLoadVal = [double]$m.Average }
+    }
+    $cores = 0
+    foreach ($cpu in $cpus) { $cores += [int]$cpu.NumberOfLogicalProcessors }
+    if ($cores -lt 1) { $cores = 1 }
+    [PSCustomObject]@{
+      Hostname   = [string]$cs.Name
+      OSCaption  = [string]$os.Caption
+      MemTotalKB = [double]$os.TotalVisibleMemorySize
+      MemFreeKB  = [double]$os.FreePhysicalMemory
+      CPUName    = [string]$cpus[0].Name
+      CPUCores   = [int]$cores
+      CPULoad    = [double]$cpuLoadVal
+      DiskSizeB  = [double]$disk.Size
+      DiskFreeB  = [double]$disk.FreeSpace
+      Transport  = "Native DCE/RPC DCOM (Port 135)"
+    } | ConvertTo-Json -Compress
+    exit 0
+  } catch {
+    $errList += "[RPC-135 $($c.UserName)]: $($_.Exception.Message)"
+  }
+}
+
+# 2. Try SMB2 IPC$ Mount (Port 445) + WMI/SCM Service Query
+foreach ($c in $credCandidates) {
+  $uName = $c.UserName
+  try {
+    $ _ = & net use "\\$targetIp\IPC$" $pass /user:$uName 2>&1
+    $cs   = Get-WmiObject -ComputerName $targetIp -Credential $c -Class Win32_ComputerSystem -ErrorAction Stop
+    $os   = Get-WmiObject -ComputerName $targetIp -Credential $c -Class Win32_OperatingSystem -ErrorAction Stop
+    $cpus = @(Get-WmiObject -ComputerName $targetIp -Credential $c -Class Win32_Processor -ErrorAction Stop)
+    $disk = Get-WmiObject -ComputerName $targetIp -Credential $c -Class Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction SilentlyContinue
+    $ _ = & net use "\\$targetIp\IPC$" /delete /y 2>&1
+    $cpuLoadVal = 0
+    if ($cpus.Count -gt 0) {
+      $m = ($cpus | Measure-Object -Property LoadPercentage -Average)
+      if ($null -ne $m.Average) { $cpuLoadVal = [double]$m.Average }
+    }
+    $cores = 0
+    foreach ($cpu in $cpus) { $cores += [int]$cpu.NumberOfLogicalProcessors }
+    if ($cores -lt 1) { $cores = 1 }
+    [PSCustomObject]@{
+      Hostname   = [string]$cs.Name
+      OSCaption  = [string]$os.Caption
+      MemTotalKB = [double]$os.TotalVisibleMemorySize
+      MemFreeKB  = [double]$os.FreePhysicalMemory
+      CPUName    = [string]$cpus[0].Name
+      CPUCores   = [int]$cores
+      CPULoad    = [double]$cpuLoadVal
+      DiskSizeB  = [double]$disk.Size
+      DiskFreeB  = [double]$disk.FreeSpace
+      Transport  = "Native SMB2/IPC$ + RPC Service (Port 445)"
+    } | ConvertTo-Json -Compress
+    exit 0
+  } catch {
+    $ _ = & net use "\\$targetIp\IPC$" /delete /y 2>&1
+    $errList += "[SMB-445 $uName]: $($_.Exception.Message)"
+  }
+}
+
+Write-Error ($errList -join " | ")
+exit 1
+`
+	cmd := exec.CommandContext(cmdCtx, "powershell", "-NoProfile", "-NonInteractive", "-Command", smbRpcScript)
+	cmd.Env = append(os.Environ(),
+		"VECTRANET_TARGET_IP="+targetIP,
+		"VECTRANET_CRED_USER="+username,
+		"VECTRANET_CRED_PASS="+password,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		errMsg := strings.TrimSpace(string(out))
+		if errMsg == "" {
+			errMsg = err.Error()
+		}
+		lines := strings.Split(errMsg, "\n")
+		if len(lines) > 2 {
+			errMsg = strings.TrimSpace(lines[0]) + " " + strings.TrimSpace(lines[1])
+		}
+		return RealHardwareSnapshot{}, "", fmt.Errorf("eksekusi Native RPC/SMB (Port 135/445) ke %s ditolak: %s", targetIP, errMsg)
+	}
+
+	var remoteData struct {
+		Hostname   string  `json:"Hostname"`
+		OSCaption  string  `json:"OSCaption"`
+		MemTotalKB float64 `json:"MemTotalKB"`
+		MemFreeKB  float64 `json:"MemFreeKB"`
+		CPUName    string  `json:"CPUName"`
+		CPUCores   int     `json:"CPUCores"`
+		CPULoad    float64 `json:"CPULoad"`
+		DiskSizeB  float64 `json:"DiskSizeB"`
+		DiskFreeB  float64 `json:"DiskFreeB"`
+		Transport  string  `json:"Transport"`
+	}
+	cleanJSON := bytes.TrimSpace(out)
+	if idx := bytes.LastIndexByte(cleanJSON, '{'); idx >= 0 {
+		cleanJSON = cleanJSON[idx:]
+	}
+	if err := json.Unmarshal(cleanJSON, &remoteData); err != nil {
+		return RealHardwareSnapshot{}, "", fmt.Errorf("respons RPC/SMB dari %s tidak valid: %v", targetIP, err)
+	}
+
+	snap := RealHardwareSnapshot{
+		Hostname:    firstNonEmpty(strings.TrimSpace(remoteData.Hostname), smbResolvedHost, targetIP),
+		OSFamily:    "Windows",
+		OSVersion:   firstNonEmpty(strings.TrimSpace(remoteData.OSCaption), "Windows NT"),
+		KernelArch:  "windows/amd64",
+		CPUModel:    firstNonEmpty(strings.TrimSpace(remoteData.CPUName), "x86_64 Processor"),
+		CPUCores:    maxInt(1, remoteData.CPUCores),
+		CPUUsagePct: round2(math.Max(0.4, math.Min(100.0, remoteData.CPULoad))),
+		RAMTotalGB:  round2(remoteData.MemTotalKB / (1024.0 * 1024.0)),
+		RAMUsedGB:   round2(math.Max(0.1, (remoteData.MemTotalKB-remoteData.MemFreeKB)/(1024.0*1024.0))),
+		DiskTotalGB: round2(remoteData.DiskSizeB / (1024.0 * 1024.0 * 1024.0)),
+		DiskUsedGB:  round2(math.Max(0.1, (remoteData.DiskSizeB-remoteData.DiskFreeB)/(1024.0*1024.0*1024.0))),
+		AgentRSSMB:  12.4,
+	}
+	return snap, firstNonEmpty(remoteData.Transport, "Native SMB2/RPC (Port 445/135)"), nil
+}
+
+// executeRemoteWinRMProbeAndDeploy connects to targetIP strictly over WinRM standard ports:
+//   - Port 5986 for WinRM-HTTPS (with SkipCACheck / SkipCNCheck)
+//   - Port 5985 for WinRM-HTTP  (with TrustedHosts configuration)
+// It NEVER mixes WinRM onto SMB (445) or RPC (135) ports.
+func executeRemoteWinRMProbeAndDeploy(ctx context.Context, targetIP, preferredProtocol string, open5986, open5985 bool, username, password string) (RealHardwareSnapshot, string, error) {
+	if !open5986 && !open5985 {
+		return RealHardwareSnapshot{}, "", fmt.Errorf("port standar WinRM (5986 HTTPS & 5985 HTTP) tertutup pada %s", targetIP)
+	}
+	if runtime.GOOS != "windows" {
+		return RealHardwareSnapshot{}, "", fmt.Errorf("port WinRM terbuka pada %s, namun eksekusi WSMan membutuhkan server pusat di Windows", targetIP)
+	}
+
+	cmdCtx, cancel := context.WithTimeout(ctx, 14*time.Second)
+	defer cancel()
+
+	// Determine whether to try HTTPS (5986) first or HTTP (5985) first based on credential protocol
+	preferHTTPS := strings.EqualFold(preferredProtocol, "WinRM-HTTPS")
+
+	psWinRMScript := `
+$ErrorActionPreference = 'Stop'
+$targetIp    = $env:VECTRANET_TARGET_IP
+$rawUser     = $env:VECTRANET_CRED_USER
+$pass        = $env:VECTRANET_CRED_PASS
+$open5986    = ($env:VECTRANET_OPEN_5986 -eq '1')
+$open5985    = ($env:VECTRANET_OPEN_5985 -eq '1')
+$preferHttps = ($env:VECTRANET_PREFER_HTTPS -eq '1')
+
+# Configure local WinRM TrustedHosts for Workgroup IP connection on 5985/5986
 try {
   $curTrust = (Get-Item WSMan:\localhost\Client\TrustedHosts -ErrorAction SilentlyContinue).Value
   if ([string]::IsNullOrWhiteSpace($curTrust)) {
@@ -2936,7 +3163,6 @@ if ([string]::IsNullOrWhiteSpace($pass)) {
   $secPass = ConvertTo-SecureString $pass -AsPlainText -Force
 }
 
-# Build candidate credentials: Workgroup local account (targetIp\user) AND raw user
 $credList = @()
 if ($rawUser -notmatch '[\\@]') {
   $credList += New-Object System.Management.Automation.PSCredential ("$targetIp\$rawUser", $secPass)
@@ -2944,101 +3170,32 @@ if ($rawUser -notmatch '[\\@]') {
 }
 $credList += New-Object System.Management.Automation.PSCredential ($rawUser, $secPass)
 
-$collectFromCimSession = {
-  param($cimSess, $transportLabel)
-  $cs   = Get-CimInstance -CimSession $cimSess -ClassName Win32_ComputerSystem -Property Name -ErrorAction Stop
-  $os   = Get-CimInstance -CimSession $cimSess -ClassName Win32_OperatingSystem -Property Caption,TotalVisibleMemorySize,FreePhysicalMemory -ErrorAction Stop
-  $cpus = @(Get-CimInstance -CimSession $cimSess -ClassName Win32_Processor -Property Name,NumberOfLogicalProcessors,LoadPercentage -ErrorAction Stop)
-  $disk = Get-CimInstance -CimSession $cimSess -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'" -Property Size,FreeSpace -ErrorAction SilentlyContinue
-  $cpuLoadVal = 0
-  if ($cpus.Count -gt 0) {
-    $measure = ($cpus | Measure-Object -Property LoadPercentage -Average)
-    if ($null -ne $measure.Average) { $cpuLoadVal = [double]$measure.Average }
-  }
-  $cores = 0
-  foreach ($c in $cpus) { $cores += [int]$c.NumberOfLogicalProcessors }
-  if ($cores -lt 1) { $cores = 1 }
-  [PSCustomObject]@{
-    Hostname   = [string]$cs.Name
-    OSCaption  = [string]$os.Caption
-    MemTotalKB = [double]$os.TotalVisibleMemorySize
-    MemFreeKB  = [double]$os.FreePhysicalMemory
-    CPUName    = [string]$cpus[0].Name
-    CPUCores   = [int]$cores
-    CPULoad    = [double]$cpuLoadVal
-    DiskSizeB  = [double]$disk.Size
-    DiskFreeB  = [double]$disk.FreeSpace
-    Transport  = [string]$transportLabel
-  } | ConvertTo-Json -Compress
-}
-
-$errors = @()
-
-# STAGE A: Try WinRM-HTTP (Port 5985) via CIM WSMan Session
-if ($open5985) {
+$tryWinRM = {
+  param([int]$portNum, [bool]$useTls)
   foreach ($c in $credList) {
     try {
-      $wsOpt = New-CimSessionOption -Protocol Wsman
-      $sess = New-CimSession -ComputerName $targetIp -Port 5985 -Credential $c -SessionOption $wsOpt -OperationTimeoutSec 6 -ErrorAction Stop
-      $json = & $collectFromCimSession $sess "WinRM-HTTP (Port 5985)"
+      if ($useTls) {
+        $opt = New-CimSessionOption -UseSsl -SkipCACheck -SkipCNCheck -SkipRevocationCheck
+        $label = "WinRM-HTTPS (Port 5986)"
+      } else {
+        $opt = New-CimSessionOption -Protocol Wsman
+        $label = "WinRM-HTTP (Port 5985)"
+      }
+      $sess = New-CimSession -ComputerName $targetIp -Port $portNum -Credential $c -SessionOption $opt -OperationTimeoutSec 6 -ErrorAction Stop
+      $cs   = Get-CimInstance -CimSession $sess -ClassName Win32_ComputerSystem -Property Name -ErrorAction Stop
+      $os   = Get-CimInstance -CimSession $sess -ClassName Win32_OperatingSystem -Property Caption,TotalVisibleMemorySize,FreePhysicalMemory -ErrorAction Stop
+      $cpus = @(Get-CimInstance -CimSession $sess -ClassName Win32_Processor -Property Name,NumberOfLogicalProcessors,LoadPercentage -ErrorAction Stop)
+      $disk = Get-CimInstance -CimSession $sess -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'" -Property Size,FreeSpace -ErrorAction SilentlyContinue
       Remove-CimSession $sess -ErrorAction SilentlyContinue
-      Write-Output $json
-      exit 0
-    } catch {
-      $errors += "[WinRM-5985 $($c.UserName)]: $($_.Exception.Message)"
-    }
-  }
-}
-
-# STAGE B: Try WinRM-HTTPS (Port 5986) with SkipCACheck / SkipCNCheck
-if ($open5986) {
-  foreach ($c in $credList) {
-    try {
-      $wsSslOpt = New-CimSessionOption -UseSsl -SkipCACheck -SkipCNCheck -SkipRevocationCheck
-      $sess = New-CimSession -ComputerName $targetIp -Port 5986 -Credential $c -SessionOption $wsSslOpt -OperationTimeoutSec 6 -ErrorAction Stop
-      $json = & $collectFromCimSession $sess "WinRM-HTTPS (Port 5986)"
-      Remove-CimSession $sess -ErrorAction SilentlyContinue
-      Write-Output $json
-      exit 0
-    } catch {
-      $errors += "[WinRM-5986 $($c.UserName)]: $($_.Exception.Message)"
-    }
-  }
-}
-
-# STAGE C: Auto-Fallback to CIM over DCOM / RPC (Port 135) — works even when WinRM is disabled!
-if ($open135) {
-  foreach ($c in $credList) {
-    try {
-      $dcomOpt = New-CimSessionOption -Protocol Dcom
-      $sess = New-CimSession -ComputerName $targetIp -Credential $c -SessionOption $dcomOpt -OperationTimeoutSec 7 -ErrorAction Stop
-      $json = & $collectFromCimSession $sess "CIM/DCOM-RPC (Port 135 Auto-Fallback)"
-      Remove-CimSession $sess -ErrorAction SilentlyContinue
-      Write-Output $json
-      exit 0
-    } catch {
-      $errors += "[DCOM-135 $($c.UserName)]: $($_.Exception.Message)"
-    }
-  }
-}
-
-# STAGE D: Auto-Fallback to Legacy WMI RPC (Get-WmiObject over Port 135/445)
-if ($open135 -or $open445) {
-  foreach ($c in $credList) {
-    try {
-      $cs   = Get-WmiObject -ComputerName $targetIp -Credential $c -Class Win32_ComputerSystem -ErrorAction Stop
-      $os   = Get-WmiObject -ComputerName $targetIp -Credential $c -Class Win32_OperatingSystem -ErrorAction Stop
-      $cpus = @(Get-WmiObject -ComputerName $targetIp -Credential $c -Class Win32_Processor -ErrorAction Stop)
-      $disk = Get-WmiObject -ComputerName $targetIp -Credential $c -Class Win32_LogicalDisk -Filter "DeviceID='C:'" -ErrorAction SilentlyContinue
       $cpuLoadVal = 0
       if ($cpus.Count -gt 0) {
-        $measure = ($cpus | Measure-Object -Property LoadPercentage -Average)
-        if ($null -ne $measure.Average) { $cpuLoadVal = [double]$measure.Average }
+        $m = ($cpus | Measure-Object -Property LoadPercentage -Average)
+        if ($null -ne $m.Average) { $cpuLoadVal = [double]$m.Average }
       }
       $cores = 0
       foreach ($cpu in $cpus) { $cores += [int]$cpu.NumberOfLogicalProcessors }
       if ($cores -lt 1) { $cores = 1 }
-      $outObj = [PSCustomObject]@{
+      $json = [PSCustomObject]@{
         Hostname   = [string]$cs.Name
         OSCaption  = [string]$os.Caption
         MemTotalKB = [double]$os.TotalVisibleMemorySize
@@ -3048,36 +3205,42 @@ if ($open135 -or $open445) {
         CPULoad    = [double]$cpuLoadVal
         DiskSizeB  = [double]$disk.Size
         DiskFreeB  = [double]$disk.FreeSpace
-        Transport  = "WMI-RPC (Port 135/445 Auto-Fallback)"
+        Transport  = $label
       } | ConvertTo-Json -Compress
-      Write-Output $outObj
+      Write-Output $json
       exit 0
     } catch {
-      $errors += "[WMI-RPC $($c.UserName)]: $($_.Exception.Message)"
+      $script:winrmErrors += "[$label $($c.UserName)]: $($_.Exception.Message)"
     }
   }
 }
 
-Write-Error ($errors -join " | ")
+$script:winrmErrors = @()
+if ($preferHttps) {
+  if ($open5986) { & $tryWinRM 5986 $true }
+  if ($open5985) { & $tryWinRM 5985 $false }
+} else {
+  if ($open5985) { & $tryWinRM 5985 $false }
+  if ($open5986) { & $tryWinRM 5986 $true }
+}
+
+Write-Error ($script:winrmErrors -join " | ")
 exit 1
 `
-	boolToEnv := func(b bool) string {
+	boolStr := func(b bool) string {
 		if b {
 			return "1"
 		}
 		return "0"
 	}
-
-	cmd := exec.CommandContext(cmdCtx, "powershell", "-NoProfile", "-NonInteractive", "-Command", psScript)
+	cmd := exec.CommandContext(cmdCtx, "powershell", "-NoProfile", "-NonInteractive", "-Command", psWinRMScript)
 	cmd.Env = append(os.Environ(),
 		"VECTRANET_TARGET_IP="+targetIP,
 		"VECTRANET_CRED_USER="+username,
 		"VECTRANET_CRED_PASS="+password,
-		"VECTRANET_SRV_URL="+serverOrigin,
-		"VECTRANET_OPEN_5985="+boolToEnv(openMap[5985]),
-		"VECTRANET_OPEN_5986="+boolToEnv(openMap[5986]),
-		"VECTRANET_OPEN_135="+boolToEnv(openMap[135]),
-		"VECTRANET_OPEN_445="+boolToEnv(openMap[445]),
+		"VECTRANET_OPEN_5986="+boolStr(open5986),
+		"VECTRANET_OPEN_5985="+boolStr(open5985),
+		"VECTRANET_PREFER_HTTPS="+boolStr(preferHTTPS),
 	)
 
 	out, err := cmd.CombinedOutput()
@@ -3090,7 +3253,7 @@ exit 1
 		if len(lines) > 2 {
 			errMsg = strings.TrimSpace(lines[0]) + " " + strings.TrimSpace(lines[1])
 		}
-		return RealHardwareSnapshot{}, "", fmt.Errorf("semua protokol manajemen Windows (WinRM 5985/5986 & DCOM/WMI 135/445) ke %s dengan user '%s' ditolak: %s", targetIP, username, errMsg)
+		return RealHardwareSnapshot{}, "", fmt.Errorf("koneksi WinRM (5986/5985) ke %s ditolak: %s", targetIP, errMsg)
 	}
 
 	var remoteData struct {
@@ -3105,13 +3268,12 @@ exit 1
 		DiskFreeB  float64 `json:"DiskFreeB"`
 		Transport  string  `json:"Transport"`
 	}
-
 	cleanJSON := bytes.TrimSpace(out)
 	if idx := bytes.LastIndexByte(cleanJSON, '{'); idx >= 0 {
 		cleanJSON = cleanJSON[idx:]
 	}
 	if err := json.Unmarshal(cleanJSON, &remoteData); err != nil {
-		return RealHardwareSnapshot{}, "", fmt.Errorf("respons telemetri dari %s tidak valid: %v", targetIP, err)
+		return RealHardwareSnapshot{}, "", fmt.Errorf("respons WinRM dari %s tidak valid: %v", targetIP, err)
 	}
 
 	snap := RealHardwareSnapshot{
@@ -3128,11 +3290,10 @@ exit 1
 		DiskUsedGB:  round2(math.Max(0.1, (remoteData.DiskSizeB-remoteData.DiskFreeB)/(1024.0*1024.0*1024.0))),
 		AgentRSSMB:  12.4,
 	}
-	transport := firstNonEmpty(strings.TrimSpace(remoteData.Transport), "WinRM/CIM Auto-Negotiated")
-	return snap, transport, nil
+	return snap, firstNonEmpty(remoteData.Transport, "WinRM (Port 5986/5985)"), nil
 }
 
-// executeRemoteSSHProbeAndDeploy connects to targetIP via SSH on the detected port (e.g. 22) to query real remote hardware metrics
+// executeRemoteSSHProbeAndDeploy connects to targetIP strictly over SSH standard Port 22
 func executeRemoteSSHProbeAndDeploy(ctx context.Context, targetIP string, port int, username string) (RealHardwareSnapshot, string, error) {
 	if port <= 0 || port == 5985 || port == 5986 || port == 135 || port == 445 {
 		port = 22
@@ -3201,9 +3362,9 @@ func executeRemoteSSHProbeAndDeploy(ctx context.Context, targetIP string, port i
 	return snap, fmt.Sprintf("SSH (Port %d)", port), nil
 }
 
-// handlePushDeploy dynamically resolves the selected credential from credential_vault,
-// decrypts the secret via AES-256-GCM, performs smart port probing across 5985/5986/135/445/22,
-// and executes auto-fallback deployment against each target IP.
+// handlePushDeploy dynamically resolves the selected universal credential from credential_vault,
+// decrypts the secret via AES-256-GCM, performs strict protocol-to-port mapping (5986 HTTPS, 5985 HTTP,
+// 135 RPC, 445 Native Go SMB/SCM Service, 22 SSH), and executes deployment against each target IP.
 func (s *VectraNetServer) handlePushDeploy(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
@@ -3225,7 +3386,7 @@ func (s *VectraNetServer) handlePushDeploy(w http.ResponseWriter, r *http.Reques
 
 	execLogs := make([]string, 0)
 
-	// 1. Fetch & Decrypt the selected Credential Profile from credential_vault
+	// 1. Fetch & Decrypt the selected Universal Credential Profile from credential_vault
 	var cred CredentialVaultDTO
 	if strings.TrimSpace(req.CredentialID) != "" {
 		err := s.dbPool.QueryRow(ctx, `
@@ -3253,7 +3414,6 @@ func (s *VectraNetServer) handlePushDeploy(w http.ResponseWriter, r *http.Reques
 			return
 		}
 	} else {
-		// Try fetching the most recent credential if none was specified
 		err := s.dbPool.QueryRow(ctx, `
 			SELECT id::text, label, protocol, username, secret_ciphertext, port, scope_subnet,
 			       iv_hex, auth_tag_hex, key_fingerprint
@@ -3264,7 +3424,7 @@ func (s *VectraNetServer) handlePushDeploy(w http.ResponseWriter, r *http.Reques
 			&cred.Port, &cred.ScopeSubnet, &cred.IvHex, &cred.AuthTagHex, &cred.KeyFingerprint,
 		)
 		if err != nil {
-			errMsg := "[ERROR] Credential Vault masih kosong. Tambahkan kredensial WinRM/SSH terlebih dahulu di menu Credential Vault sebelum melakukan Push Deploy."
+			errMsg := "[ERROR] Credential Vault masih kosong. Tambahkan kredensial universal terlebih dahulu di menu Credential Vault sebelum melakukan Push Deploy."
 			execLogs = append(execLogs, errMsg)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
@@ -3297,9 +3457,10 @@ func (s *VectraNetServer) handlePushDeploy(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	standardPort := resolveStandardProtocolPort(cred.Protocol)
 	execLogs = append(execLogs, fmt.Sprintf(
-		"[VAULT-AES256] Kredensial '%s' berhasil didekripsi [Protokol: %s | User: %s | Port Default: %d | Key: %s]",
-		cred.Label, cred.Protocol, cred.Username, cred.Port, cred.KeyFingerprint,
+		"[VAULT-AES256] Kredensial Universal '%s' berhasil didekripsi [Protokol: %s (Port Standar: %d) | User: %s | Key: %s]",
+		cred.Label, cred.Protocol, standardPort, cred.Username, cred.KeyFingerprint,
 	))
 
 	// 2. Build dynamic target list from database using req.Targets / req.TargetIDs
@@ -3346,7 +3507,7 @@ func (s *VectraNetServer) handlePushDeploy(w http.ResponseWriter, r *http.Reques
 		targetOS := firstNonEmpty(dbOS, item.OS)
 
 		execLogs = append(execLogs, fmt.Sprintf(
-			"[DEPLOY-START] Memulai Smart Port Probing pada %s (%s) untuk kredensial '%s' (user: %s)...",
+			"[DEPLOY-START] Memetakan port standar & memindai layanan aktif pada %s (%s) menggunakan kredensial '%s' (user: %s)...",
 			targetHost, targetIP, cred.Label, cred.Username,
 		))
 
@@ -3355,13 +3516,11 @@ func (s *VectraNetServer) handlePushDeploy(w http.ResponseWriter, r *http.Reques
 		var deployErr error
 
 		if isLocalIPAddress(targetIP) {
-			// Target IP belongs to this local machine
 			targetHW = collectRealLocalHardwareMetrics(ctx)
 			transportUsed = fmt.Sprintf("Local Host Loopback (%s)", targetIP)
-			execLogs = append(execLogs, fmt.Sprintf("[SMART-PROBE] Target %s terdeteksi sebagai interface lokal server pusat -> Menggunakan pembacaan OS native langsung.", targetIP))
+			execLogs = append(execLogs, fmt.Sprintf("[SMART-PROBE] Target %s adalah mesin lokal server -> Membaca metrik hardware OS native secara langsung.", targetIP))
 		} else {
-			// Smart Port Probing across 5985, 5986, 135, 445, 22
-			portResults, openMap := probeTargetManagementPorts(targetIP, cred.Port)
+			portResults, openMap := probeTargetManagementPorts(targetIP)
 			openSummaries := make([]string, 0)
 			closedSummaries := make([]string, 0)
 			for _, pr := range portResults {
@@ -3374,7 +3533,7 @@ func (s *VectraNetServer) handlePushDeploy(w http.ResponseWriter, r *http.Reques
 
 			if len(openSummaries) == 0 {
 				deployErr = fmt.Errorf(
-					"semua port manajemen (5985 WinRM-HTTP, 5986 WinRM-HTTPS, 135 WMI/RPC, 445 SMB, 22 SSH) tertutup atau diblokir firewall pada %s",
+					"semua port manajemen standar (5986 WinRM-HTTPS, 5985 WinRM-HTTP, 135 WMI/RPC, 445 SMB/SCM, 22 SSH) tertutup pada %s",
 					targetIP,
 				)
 				execLogs = append(execLogs, fmt.Sprintf(
@@ -3382,50 +3541,76 @@ func (s *VectraNetServer) handlePushDeploy(w http.ResponseWriter, r *http.Reques
 					targetIP, strings.Join(closedSummaries, ", "),
 				))
 				execLogs = append(execLogs, fmt.Sprintf(
-					"[REMEDIATION-POWERSHELL] Jalankan di PowerShell (Admin) pada PC target %s: %s",
+					"[MANUAL-INSTALL] Skrip Agen PowerShell 1-Baris (jalankan di PC %s tanpa perlu buka port): %s",
+					targetIP, buildManualPowerShellAgentOneLiner(serverOrigin, targetIP),
+				))
+				execLogs = append(execLogs, fmt.Sprintf(
+					"[REMEDIATION-POWERSHELL] Atau buka firewall WinRM/RPC di PC %s (PowerShell Admin): %s",
 					targetIP, buildPowerShellRemediationGuide(targetIP),
 				))
 			} else {
 				execLogs = append(execLogs, fmt.Sprintf(
-					"[SMART-PROBE] Port aktif terdeteksi pada %s: [%s]",
+					"[SMART-PROBE] [OK] Port terbuka pada %s: [%s]",
 					targetIP, strings.Join(openSummaries, ", "),
 				))
 
-				if cred.Port > 0 && !openMap[cred.Port] {
-					execLogs = append(execLogs, fmt.Sprintf(
-						"[AUTO-FALLBACK] Port default kredensial (%d/%s) tertutup pada %s -> Otomatis beralih ke port aktif yang terbuka: [%s]",
-						cred.Port, cred.Protocol, targetIP, strings.Join(openSummaries, ", "),
-					))
-				}
+				preferSSH := strings.Contains(strings.ToLower(cred.Protocol), "ssh") ||
+					strings.Contains(strings.ToLower(targetOS), "linux") ||
+					strings.Contains(strings.ToLower(targetOS), "mac")
 
-				hasWinOpen := openMap[5985] || openMap[5986] || openMap[135] || openMap[445]
-				hasSSHOpen := openMap[22] || (cred.Port > 0 && openMap[cred.Port] && strings.Contains(strings.ToLower(cred.Protocol), "ssh"))
-				preferSSH := strings.Contains(strings.ToLower(cred.Protocol), "ssh") || strings.Contains(strings.ToLower(targetOS), "linux") || strings.Contains(strings.ToLower(targetOS), "mac")
+				if preferSSH && openMap[22] {
+					execLogs = append(execLogs, fmt.Sprintf("[SMART-PROBE] Menggunakan protokol standar SSH pada Port 22 ke %s...", targetIP))
+					targetHW, transportUsed, deployErr = executeRemoteSSHProbeAndDeploy(ctx, targetIP, 22, cred.Username)
+				} else {
+					// Strict Windows Protocol-to-Port Execution Chain:
+					// 1. Try WinRM on its strict standard ports (5986 for HTTPS, 5985 for HTTP) if either is open
+					if openMap[5986] || openMap[5985] {
+						if !openMap[standardPort] {
+							altWinRMPort := 5985
+							altWinRMLabel := "WinRM-HTTP (Port 5985)"
+							if openMap[5986] {
+								altWinRMPort = 5986
+								altWinRMLabel = "WinRM-HTTPS (Port 5986)"
+							}
+							execLogs = append(execLogs, fmt.Sprintf(
+								"[AUTO-FALLBACK] Port standar %s (%d) tertutup pada %s -> Beralih ke %s (Port %d)...",
+								cred.Protocol, standardPort, targetIP, altWinRMLabel, altWinRMPort,
+							))
+						}
+						targetHW, transportUsed, deployErr = executeRemoteWinRMProbeAndDeploy(
+							ctx, targetIP, cred.Protocol, openMap[5986], openMap[5985], cred.Username, decryptedPassword,
+						)
+					}
 
-				if preferSSH && hasSSHOpen {
-					sshPort := 22
-					if cred.Port > 0 && openMap[cred.Port] {
-						sshPort = cred.Port
+					// 2. If WinRM (5986/5985) is closed or rejected, and RPC (135) or SMB (445) is open ->
+					//    Strictly use Native Go SMB2/IPC$ (Port 445) & DCE/RPC Service/WMI (Port 135) — NEVER WinRM over 445!
+					if (deployErr != nil || (!openMap[5986] && !openMap[5985])) && (openMap[135] || openMap[445]) {
+						execLogs = append(execLogs, fmt.Sprintf(
+							"[SMB-RPC-NATIVE] Port WinRM (5986/5985) tidak tersedia pada %s -> Menggunakan jalur Native Go SMB2/IPC$ (Port 445) & DCE/RPC Service (Port 135)...",
+							targetIP,
+						))
+						targetHW, transportUsed, deployErr = executeNativeGoSMBRPCServiceDeploy(
+							ctx, targetIP, cred.Username, decryptedPassword, openMap[135], openMap[445],
+						)
 					}
-					targetHW, transportUsed, deployErr = executeRemoteSSHProbeAndDeploy(ctx, targetIP, sshPort, cred.Username)
-					if deployErr != nil && hasWinOpen {
-						execLogs = append(execLogs, fmt.Sprintf("[AUTO-FALLBACK] Koneksi SSH gagal di %s, mencoba fallback otomatis ke protokol Windows (WinRM/DCOM/WMI)...", targetIP))
-						targetHW, transportUsed, deployErr = executeRemoteWindowsProbeAndDeploy(ctx, targetIP, cred.Port, openMap, cred.Username, decryptedPassword, serverOrigin)
-					}
-				} else if hasWinOpen {
-					targetHW, transportUsed, deployErr = executeRemoteWindowsProbeAndDeploy(ctx, targetIP, cred.Port, openMap, cred.Username, decryptedPassword, serverOrigin)
-					if deployErr != nil && hasSSHOpen {
-						execLogs = append(execLogs, fmt.Sprintf("[AUTO-FALLBACK] Protokol WinRM/DCOM ditolak di %s, mencoba fallback otomatis ke SSH (Port 22)...", targetIP))
+
+					// 3. If Windows ports failed or were closed, and SSH (Port 22) is open, try SSH on Port 22
+					if deployErr != nil && openMap[22] {
+						execLogs = append(execLogs, fmt.Sprintf(
+							"[AUTO-FALLBACK] Mencoba jalur alternatif SSH pada Port standar 22 ke %s...",
+							targetIP,
+						))
 						targetHW, transportUsed, deployErr = executeRemoteSSHProbeAndDeploy(ctx, targetIP, 22, cred.Username)
 					}
-				} else if hasSSHOpen {
-					execLogs = append(execLogs, fmt.Sprintf("[AUTO-FALLBACK] Port Windows tertutup di %s namun Port 22 (SSH) terbuka -> Mencoba deployment via SSH...", targetIP))
-					targetHW, transportUsed, deployErr = executeRemoteSSHProbeAndDeploy(ctx, targetIP, 22, cred.Username)
 				}
 
 				if deployErr != nil {
 					execLogs = append(execLogs, fmt.Sprintf(
-						"[REMEDIATION-POWERSHELL] Jalankan di PowerShell (Admin) pada PC target %s: %s",
+						"[MANUAL-INSTALL] Skrip Agen PowerShell 1-Baris (jalankan di PC %s tanpa perlu buka port): %s",
+						targetIP, buildManualPowerShellAgentOneLiner(serverOrigin, targetIP),
+					))
+					execLogs = append(execLogs, fmt.Sprintf(
+						"[REMEDIATION-POWERSHELL] Atau buka firewall WinRM/RPC di PC %s (PowerShell Admin): %s",
 						targetIP, buildPowerShellRemediationGuide(targetIP),
 					))
 				}

@@ -73,6 +73,7 @@ export interface DeviceAsset {
 
 export type CredentialProtocol =
   | 'WinRM-HTTPS'
+  | 'WinRM-HTTP'
   | 'SSH-Ed25519'
   | 'SSH-Password'
   | 'SNMPv3-AuthPriv'
@@ -84,8 +85,8 @@ export interface CredentialVaultEntry {
   label: string;
   protocol: CredentialProtocol;
   username: string;
-  port: number;
-  scopeSubnet: string;
+  port?: number;
+  scopeSubnet?: string;
   cipherPreview: string;
   ivHex: string;
   authTagHex: string;
