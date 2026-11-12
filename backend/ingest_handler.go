@@ -34,6 +34,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -56,6 +57,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf16"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -447,6 +449,11 @@ func ensureSchema(ctx context.Context, db *pgxpool.Pool) error {
 		message         TEXT NOT NULL,
 		latency_ms      NUMERIC(8,2) NOT NULL DEFAULT 1.0
 	);
+
+	-- Clean any legacy 'HOST-...' fallback strings so devices use their clean IP until resolved
+	UPDATE devices
+	SET hostname = host(ip_address)
+	WHERE UPPER(hostname) LIKE 'HOST-%' OR TRIM(hostname) = '';
 	`
 	_, err := db.Exec(ctx, ddl)
 	return err
@@ -789,37 +796,31 @@ func (s *VectraNetServer) handleGetDevices(w http.ResponseWriter, r *http.Reques
 		devices = append(devices, dev)
 	}
 
-	// Self-heal any existing devices in PostgreSQL that still have a fallback 'HOST-...' or raw IP hostname
-	var healWg sync.WaitGroup
-	var healMu sync.Mutex
+	// Clean any legacy 'HOST-...' prefix immediately and trigger non-blocking background resolution
+	// for any device whose hostname is still just its IP address
 	for idx := range devices {
 		hName := strings.TrimSpace(devices[idx].Hostname)
-		if hName == "" || strings.HasPrefix(strings.ToUpper(hName), "HOST-") || hName == devices[idx].IPAddress {
-			healWg.Add(1)
-			go func(i int) {
-				defer healWg.Done()
-				ip := devices[i].IPAddress
-				resolved := ""
-				if isLocalIPAddress(ip) {
-					if localHost, err := os.Hostname(); err == nil && strings.TrimSpace(localHost) != "" {
-						resolved = strings.TrimSpace(localHost)
-					}
-				}
-				if resolved == "" {
-					resolved = resolveReverseDNS(ip, 650*time.Millisecond)
-				}
-				if resolved != "" && !strings.HasPrefix(strings.ToUpper(resolved), "HOST-") && resolved != ip {
-					healMu.Lock()
-					devices[i].Hostname = resolved
-					healMu.Unlock()
-					bgCtx, bgCancel := context.WithTimeout(context.Background(), 2*time.Second)
-					_, _ = s.dbPool.Exec(bgCtx, `UPDATE devices SET hostname = $2, updated_at = NOW() WHERE id = $1::uuid`, devices[i].ID, resolved)
+		if hName == "" || strings.HasPrefix(strings.ToUpper(hName), "HOST-") {
+			devices[idx].Hostname = devices[idx].IPAddress
+			hName = devices[idx].IPAddress
+		}
+		if hName == devices[idx].IPAddress {
+			devID := devices[idx].ID
+			devIP := devices[idx].IPAddress
+			go func(id, ip string) {
+				resolved := resolveReverseDNS(ip, 1500*time.Millisecond)
+				if resolved != "" && resolved != ip && !strings.HasPrefix(strings.ToUpper(resolved), "HOST-") {
+					bgCtx, bgCancel := context.WithTimeout(context.Background(), 3*time.Second)
+					_, _ = s.dbPool.Exec(bgCtx, `
+						UPDATE devices
+						SET hostname = $2, updated_at = NOW()
+						WHERE id = $1::uuid AND (hostname = host(ip_address) OR UPPER(hostname) LIKE 'HOST-%' OR hostname = '')
+					`, id, resolved)
 					bgCancel()
 				}
-			}(idx)
+			}(devID, devIP)
 		}
 	}
-	healWg.Wait()
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(devices)
@@ -1683,9 +1684,10 @@ func probeRealHost(ip string, localIfaces map[string]localIfaceInfo) (Discovered
 		minLatency = math.Max(0.5, math.Round(float64(time.Since(start).Microseconds())/100.0)/10.0)
 	}
 
-	hostname := resolveReverseDNS(ip, 900*time.Millisecond)
+	hostname := resolveReverseDNS(ip, 1500*time.Millisecond)
 	if hostname == "" {
-		hostname = fmt.Sprintf("HOST-%s", strings.ReplaceAll(ip, ".", "-"))
+		// Never use 'HOST-172-...' or mock names; use the clean IPv4 address if no name protocol responded
+		hostname = ip
 	}
 
 	osFamily, osVersion, role := fingerprintOSAndRole(openPorts)
@@ -1733,17 +1735,22 @@ func (s *VectraNetServer) persistDiscoveredHost(cidr string, h DiscoveredHostRes
 		}
 	}
 
+	cleanHostname := strings.TrimSpace(h.Hostname)
+	if cleanHostname == "" || strings.HasPrefix(strings.ToUpper(cleanHostname), "HOST-") {
+		cleanHostname = h.IPAddress
+	}
+
 	var deviceID string
 	// First check if a device with this exact IP already exists
 	err := s.dbPool.QueryRow(ctx, `SELECT id::text FROM devices WHERE host(ip_address) = $1 LIMIT 1`, h.IPAddress).Scan(&deviceID)
 	if err == nil && deviceID != "" {
 		// Device already exists for this IP:
-		// Upgrade hostname if h.Hostname is a real resolved name (not 'HOST-%') or if existing DB hostname is empty/'HOST-%',
-		// while preserving existing real hostnames, agent_state, and hardware metrics!
+		// Upgrade hostname if cleanHostname is a real resolved name (not raw IP and not 'HOST-%'),
+		// or replace legacy 'HOST-%' with cleanHostname, while preserving existing real hostnames!
 		_, _ = s.dbPool.Exec(ctx, `
 			UPDATE devices SET
 				hostname = CASE
-					WHEN $4 <> '' AND UPPER($4) NOT LIKE 'HOST-%' THEN $4
+					WHEN $4 <> '' AND $4 <> $5 AND UPPER($4) NOT LIKE 'HOST-%' THEN $4
 					WHEN devices.hostname IS NULL OR devices.hostname = '' OR UPPER(devices.hostname) LIKE 'HOST-%' THEN $4
 					ELSE devices.hostname
 				END,
@@ -1753,7 +1760,7 @@ func (s *VectraNetServer) persistDiscoveredHost(cidr string, h DiscoveredHostRes
 				last_seen   = NOW(),
 				updated_at  = NOW()
 			WHERE id = $1::uuid
-		`, deviceID, cidr, h.LatencyMs, h.Hostname)
+		`, deviceID, cidr, h.LatencyMs, cleanHostname, h.IPAddress)
 	} else {
 		// Newly discovered host: insert as 'agentless' with 0 CPU/RAM metrics (no shared telemetry!)
 		err = s.dbPool.QueryRow(ctx, `
@@ -1768,7 +1775,7 @@ func (s *VectraNetServer) persistDiscoveredHost(cidr string, h DiscoveredHostRes
 			)
 			ON CONFLICT (mac_address) DO UPDATE SET
 				hostname = CASE
-					WHEN EXCLUDED.hostname <> '' AND UPPER(EXCLUDED.hostname) NOT LIKE 'HOST-%' THEN EXCLUDED.hostname
+					WHEN EXCLUDED.hostname <> '' AND EXCLUDED.hostname <> host(EXCLUDED.ip_address) AND UPPER(EXCLUDED.hostname) NOT LIKE 'HOST-%' THEN EXCLUDED.hostname
 					WHEN devices.hostname IS NULL OR devices.hostname = '' OR UPPER(devices.hostname) LIKE 'HOST-%' THEN EXCLUDED.hostname
 					ELSE devices.hostname
 				END,
@@ -1779,7 +1786,7 @@ func (s *VectraNetServer) persistDiscoveredHost(cidr string, h DiscoveredHostRes
 				updated_at  = NOW()
 			RETURNING id::text;
 		`,
-			h.Hostname,
+			cleanHostname,
 			h.IPAddress,
 			normMAC,
 			h.OSFamily,
@@ -2043,9 +2050,14 @@ func deriveDeterministicMACFromIP(ipStr string) string {
 	return "02:56:00:00:00:01"
 }
 
-// resolveReverseDNS resolves the real device hostname for an IPv4 address using concurrent
-// Reverse DNS PTR lookup, NetBIOS Node Status (UDP 137 NBSTAT), mDNS Reverse PTR (UDP 5353),
-// and OS native name resolution (Windows ping -a / nbtstat -A, Linux/macOS getent).
+// resolveReverseDNS resolves the real, unique device hostname for an IPv4 address using concurrent
+// multi-protocol probes:
+//   1. Reverse DNS PTR (net.DefaultResolver.LookupAddr)
+//   2. SMB2 NTLMSSP Challenge TargetInfo over TCP 445 (MsvAvDnsComputerName / MsvAvNbComputerName)
+//   3. WinRM / HTTP NTLMSSP Challenge TargetInfo over TCP 5985 / 80
+//   4. NetBIOS Node Status (RFC 1002 NBSTAT) over UDP 137
+//   5. mDNS Reverse PTR over UDP 5353 (unicast & multicast)
+//   6. OS Native Resolver (Windows ping -a / nbtstat -A with dedicated contexts, Linux/macOS getent)
 func resolveReverseDNS(ip string, timeout time.Duration) string {
 	if isLocalIPAddress(ip) {
 		if h, err := os.Hostname(); err == nil && strings.TrimSpace(h) != "" {
@@ -2053,15 +2065,15 @@ func resolveReverseDNS(ip string, timeout time.Duration) string {
 		}
 	}
 
-	if timeout < 450*time.Millisecond {
-		timeout = 650 * time.Millisecond
+	if timeout < 800*time.Millisecond {
+		timeout = 1200 * time.Millisecond
 	}
 
 	type resultItem struct {
 		priority int
 		name     string
 	}
-	resCh := make(chan resultItem, 4)
+	resCh := make(chan resultItem, 6)
 	var wg sync.WaitGroup
 
 	// 1. Standard Reverse DNS PTR (net.DefaultResolver.LookupAddr)
@@ -2072,45 +2084,66 @@ func resolveReverseDNS(ip string, timeout time.Duration) string {
 		defer cancel()
 		names, err := net.DefaultResolver.LookupAddr(ctx, ip)
 		if err == nil && len(names) > 0 {
-			clean := sanitizeResolvedHostname(names[0], ip)
-			if clean != "" {
-				resCh <- resultItem{priority: 1, name: clean}
+			for _, raw := range names {
+				if clean := sanitizeResolvedHostname(raw, ip); clean != "" {
+					resCh <- resultItem{priority: 1, name: clean}
+					return
+				}
 			}
 		}
 	}()
 
-	// 2. Native NetBIOS Node Status Query (RFC 1002 NBSTAT over UDP port 137) — fast & accurate for Windows/Samba PCs
+	// 2. SMB2 NTLMSSP Challenge TargetInfo over TCP port 445 (reads exact Windows/Samba Computer Name without credentials)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if nbName := queryNetBIOSName(ip, timeout); nbName != "" {
-			clean := sanitizeResolvedHostname(nbName, ip)
-			if clean != "" {
+		if smbName := querySMBNTLMSSPHostname(ip, timeout); smbName != "" {
+			if clean := sanitizeResolvedHostname(smbName, ip); clean != "" {
 				resCh <- resultItem{priority: 2, name: clean}
 			}
 		}
 	}()
 
-	// 3. Unicast / Multicast mDNS Reverse PTR Query (UDP port 5353) — resolves .local names on macOS, Linux & Windows 10/11
+	// 3. WinRM / HTTP NTLMSSP Challenge TargetInfo over TCP port 5985
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if mdnsName := queryMDNSHostname(ip, timeout); mdnsName != "" {
-			clean := sanitizeResolvedHostname(mdnsName, ip)
-			if clean != "" {
+		if winrmName := queryWinRMNTLMSSPHostname(ip, timeout); winrmName != "" {
+			if clean := sanitizeResolvedHostname(winrmName, ip); clean != "" {
 				resCh <- resultItem{priority: 3, name: clean}
 			}
 		}
 	}()
 
-	// 4. OS Command Fallback (Windows ping -a / nbtstat -A, Linux/macOS getent hosts)
+	// 4. Native NetBIOS Node Status Query (RFC 1002 NBSTAT over UDP port 137)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if nbName := queryNetBIOSName(ip, timeout); nbName != "" {
+			if clean := sanitizeResolvedHostname(nbName, ip); clean != "" {
+				resCh <- resultItem{priority: 4, name: clean}
+			}
+		}
+	}()
+
+	// 5. Unicast / Multicast mDNS Reverse PTR Query (UDP port 5353)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if mdnsName := queryMDNSHostname(ip, timeout); mdnsName != "" {
+			if clean := sanitizeResolvedHostname(mdnsName, ip); clean != "" {
+				resCh <- resultItem{priority: 5, name: clean}
+			}
+		}
+	}()
+
+	// 6. OS Command Fallback (Windows ping -a / nbtstat -A, Linux/macOS getent hosts)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		if osName := resolveOSCommandHostname(ip, timeout); osName != "" {
-			clean := sanitizeResolvedHostname(osName, ip)
-			if clean != "" {
-				resCh <- resultItem{priority: 4, name: clean}
+			if clean := sanitizeResolvedHostname(osName, ip); clean != "" {
+				resCh <- resultItem{priority: 6, name: clean}
 			}
 		}
 	}()
@@ -2140,7 +2173,6 @@ func sanitizeResolvedHostname(raw, ip string) string {
 	if strings.HasPrefix(strings.ToUpper(s), "HOST-") {
 		return ""
 	}
-	// Strip control characters
 	var b strings.Builder
 	for _, r := range s {
 		if r > 32 && r < 127 {
@@ -2152,6 +2184,221 @@ func sanitizeResolvedHostname(raw, ip string) string {
 		return ""
 	}
 	return cleaned
+}
+
+// parseNTLMSSPChallengeHostname locates an NTLMSSP_CHALLENGE_MESSAGE (Type 2) inside raw bytes
+// and decodes the target machine's unique MsvAvDnsComputerName (0x0003) or MsvAvNbComputerName (0x0001)
+// from the UTF-16LE TargetInfo AV_PAIR list.
+func parseNTLMSSPChallengeHostname(buf []byte) string {
+	sig := []byte{'N', 'T', 'L', 'M', 'S', 'S', 'P', 0x00, 0x02, 0x00, 0x00, 0x00}
+	idx := bytes.Index(buf, sig)
+	if idx < 0 {
+		return ""
+	}
+	ntlm := buf[idx:]
+	if len(ntlm) < 48 {
+		return ""
+	}
+
+	targetInfoLen := int(binary.LittleEndian.Uint16(ntlm[40:42]))
+	targetInfoOffset := int(binary.LittleEndian.Uint32(ntlm[44:48]))
+
+	nbComputerName := ""
+	dnsComputerName := ""
+
+	if targetInfoLen > 0 && targetInfoOffset >= 48 && targetInfoOffset+targetInfoLen <= len(ntlm) {
+		av := ntlm[targetInfoOffset : targetInfoOffset+targetInfoLen]
+		pos := 0
+		for pos+4 <= len(av) {
+			avID := binary.LittleEndian.Uint16(av[pos : pos+2])
+			avLen := int(binary.LittleEndian.Uint16(av[pos+2 : pos+4]))
+			pos += 4
+			if avID == 0x0000 || pos+avLen > len(av) {
+				break
+			}
+			valBytes := av[pos : pos+avLen]
+			pos += avLen
+
+			// 0x0001 = MsvAvNbComputerName, 0x0003 = MsvAvDnsComputerName
+			if (avID == 0x0001 || avID == 0x0003) && len(valBytes) >= 2 && len(valBytes)%2 == 0 {
+				u16 := make([]uint16, len(valBytes)/2)
+				for i := 0; i < len(u16); i++ {
+					u16[i] = binary.LittleEndian.Uint16(valBytes[i*2 : i*2+2])
+				}
+				decoded := strings.TrimSpace(string(utf16.Decode(u16)))
+				if decoded != "" {
+					if avID == 0x0003 {
+						dnsComputerName = decoded
+					} else if avID == 0x0001 {
+						nbComputerName = decoded
+					}
+				}
+			}
+		}
+	}
+
+	if nbComputerName != "" {
+		return nbComputerName
+	}
+	if dnsComputerName != "" {
+		return dnsComputerName
+	}
+
+	// Fallback to TargetName field (bytes 12..20)
+	tNameLen := int(binary.LittleEndian.Uint16(ntlm[12:14]))
+	tNameOff := int(binary.LittleEndian.Uint32(ntlm[16:20]))
+	if tNameLen >= 2 && tNameOff >= 32 && tNameOff+tNameLen <= len(ntlm) && tNameLen%2 == 0 {
+		valBytes := ntlm[tNameOff : tNameOff+tNameLen]
+		u16 := make([]uint16, len(valBytes)/2)
+		for i := 0; i < len(u16); i++ {
+			u16[i] = binary.LittleEndian.Uint16(valBytes[i*2 : i*2+2])
+		}
+		return strings.TrimSpace(string(utf16.Decode(u16)))
+	}
+	return ""
+}
+
+// querySMBNTLMSSPHostname performs an unauthenticated SMB2 Negotiate + Session Setup (NTLMSSP Type 1)
+// handshake on TCP port 445 and extracts the Windows/Samba computer name from the Type 2 Challenge.
+func querySMBNTLMSSPHostname(ip string, timeout time.Duration) string {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, "445"), minDuration(timeout, 750*time.Millisecond))
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+
+	// 1. SMB2 Negotiate Request (Offering dialects 0x0202, 0x0210)
+	smb2Negotiate := []byte{
+		0x00, 0x00, 0x00, 0x66, // NetBIOS Session Length = 102 bytes
+		0xFE, 'S', 'M', 'B', // SMB2 ProtocolId
+		0x40, 0x00, // StructureSize = 64
+		0x00, 0x00, // CreditCharge
+		0x00, 0x00, 0x00, 0x00, // Status
+		0x00, 0x00, // Command = NEGOTIATE (0x0000)
+		0x01, 0x00, // CreditRequest = 1
+		0x00, 0x00, 0x00, 0x00, // Flags
+		0x00, 0x00, 0x00, 0x00, // NextCommand
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // MessageId = 0
+		0x00, 0x00, 0x00, 0x00, // Reserved
+		0x00, 0x00, 0x00, 0x00, // TreeId
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // SessionId
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Signature (16B)
+		// SMB2 Negotiate Body (38 bytes)
+		0x24, 0x00, // StructureSize = 36
+		0x02, 0x00, // DialectCount = 2
+		0x01, 0x00, // SecurityMode = Signing Enabled
+		0x00, 0x00, // Reserved
+		0x00, 0x00, 0x00, 0x00, // Capabilities
+		0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+		0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x01, // ClientGuid (16B)
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // NegotiateContextOffset/Count
+		0x02, 0x02, // Dialect SMB 2.0.2
+		0x10, 0x02, // Dialect SMB 2.1
+	}
+
+	if _, err := conn.Write(smb2Negotiate); err != nil {
+		return ""
+	}
+	negResp := make([]byte, 1024)
+	if _, err := conn.Read(negResp); err != nil {
+		return ""
+	}
+
+	// 2. SMB2 Session Setup Request (MessageId = 1) with raw NTLMSSP_NEGOTIATE (Type 1) security blob
+	ntlmNegotiate := []byte{
+		'N', 'T', 'L', 'M', 'S', 'S', 'P', 0x00,
+		0x01, 0x00, 0x00, 0x00, // Type 1 (Negotiate)
+		0x07, 0x82, 0x08, 0xA2, // Flags (UNICODE | REQUEST_TARGET | NTLM | ALWAYS_SIGN | EXTENDED_SESSIONSECURITY | TARGET_INFO)
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // DomainNameFields
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // WorkstationFields
+	}
+
+	// Total SMB2 payload = 64 (header) + 24 (SessionSetup fixed) + 32 (ntlmNegotiate) = 120 bytes (0x78)
+	smb2SessionSetup := []byte{
+		0x00, 0x00, 0x00, 0x78, // NetBIOS Session Length = 120 bytes
+		0xFE, 'S', 'M', 'B',
+		0x40, 0x00, // StructureSize = 64
+		0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+		0x01, 0x00, // Command = SESSION_SETUP (0x0001)
+		0x01, 0x00, // CreditRequest = 1
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+		0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // MessageId = 1
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		// Session Setup Body (24 bytes)
+		0x19, 0x00, // StructureSize = 25
+		0x00,       // Flags
+		0x01,       // SecurityMode
+		0x00, 0x00, 0x00, 0x00, // Capabilities
+		0x00, 0x00, 0x00, 0x00, // Channel
+		0x58, 0x00, // SecurityBufferOffset = 88 (64 + 24)
+		0x20, 0x00, // SecurityBufferLength = 32
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // PreviousSessionId
+	}
+	smb2SessionSetup = append(smb2SessionSetup, ntlmNegotiate...)
+
+	if _, err := conn.Write(smb2SessionSetup); err != nil {
+		return ""
+	}
+	setupResp := make([]byte, 2048)
+	n, err := conn.Read(setupResp)
+	if err != nil || n < 64 {
+		return ""
+	}
+	return parseNTLMSSPChallengeHostname(setupResp[:n])
+}
+
+// queryWinRMNTLMSSPHostname probes HTTP/WinRM port 5985 with an NTLMSSP Negotiate header
+// and extracts the computer name from the WWW-Authenticate Type 2 Challenge response.
+func queryWinRMNTLMSSPHostname(ip string, timeout time.Duration) string {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, "5985"), minDuration(timeout, 650*time.Millisecond))
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+
+	req := fmt.Sprintf(
+		"POST /wsman HTTP/1.1\r\nHost: %s:5985\r\nAuthorization: Negotiate TlRMTVNTUAABAAAAB4IIogAAAAAAAAAAAAAAAAAAAAAGAbEdAAAADw==\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+		ip,
+	)
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return ""
+	}
+	resp := make([]byte, 4096)
+	n, err := conn.Read(resp)
+	if err != nil || n == 0 {
+		return ""
+	}
+	lines := strings.Split(string(resp[:n]), "\r\n")
+	for _, line := range lines {
+		lower := strings.ToLower(strings.TrimSpace(line))
+		if strings.HasPrefix(lower, "www-authenticate:") {
+			parts := strings.Fields(line)
+			if len(parts) >= 3 {
+				if raw, decErr := base64.StdEncoding.DecodeString(strings.TrimSpace(parts[2])); decErr == nil {
+					if name := parseNTLMSSPChallengeHostname(raw); name != "" {
+						return name
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // queryNetBIOSName sends an RFC 1002 NetBIOS Node Status (NBSTAT) UDP packet to <ip>:137
@@ -2364,34 +2611,61 @@ func decodeDNSName(msg []byte, offset int) string {
 	return strings.Join(parts, ".")
 }
 
-var winPingHostRegex = regexp.MustCompile(`(?i)pinging\s+([^\s\[\]]+)\s+\[\d+\.\d+\.\d+\.\d+\]`)
-var nbtstatRowRegex = regexp.MustCompile(`(?m)^\s*([A-Za-z0-9\-_]{1,15})\s+<00>\s+UNIQUE`)
+var nbtstatRowRegex = regexp.MustCompile(`(?m)^\s*([A-Za-z0-9\-_]{1,15})\s+<(?:00|20)>\s+UNIQUE`)
 
 func resolveOSCommandHostname(ip string, timeout time.Duration) string {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout+250*time.Millisecond)
-	defer cancel()
-
 	if runtime.GOOS == "windows" {
-		// 1. Windows 'ping -a -n 1 -w 450 <ip>' resolves via DNS + LLMNR + NetBIOS + Hosts
-		out, _ := exec.CommandContext(ctx, "ping", "-a", "-n", "1", "-w", "450", ip).CombinedOutput()
-		if m := winPingHostRegex.FindStringSubmatch(string(out)); len(m) >= 2 {
-			candidate := strings.TrimSpace(m[1])
-			if candidate != "" && candidate != ip {
-				return candidate
+		// Run 'nbtstat -A <ip>' and 'ping -a -n 1 -w 250 <ip>' concurrently with independent contexts
+		// so one slow command never cancels the other!
+		resCh := make(chan string, 2)
+		var wg sync.WaitGroup
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			nbtCtx, nbtCancel := context.WithTimeout(context.Background(), timeout+600*time.Millisecond)
+			defer nbtCancel()
+			nbtOut, _ := exec.CommandContext(nbtCtx, "nbtstat", "-A", ip).CombinedOutput()
+			if m := nbtstatRowRegex.FindStringSubmatch(string(nbtOut)); len(m) >= 2 {
+				candidate := strings.TrimSpace(m[1])
+				if candidate != "" && candidate != ip {
+					resCh <- candidate
+				}
 			}
-		}
-		// 2. Windows 'nbtstat -A <ip>' fallback
-		nbtOut, _ := exec.CommandContext(ctx, "nbtstat", "-A", ip).CombinedOutput()
-		if m := nbtstatRowRegex.FindStringSubmatch(string(nbtOut)); len(m) >= 2 {
-			candidate := strings.TrimSpace(m[1])
-			if candidate != "" && candidate != ip {
-				return candidate
+		}()
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pingCtx, pingCancel := context.WithTimeout(context.Background(), timeout+900*time.Millisecond)
+			defer pingCancel()
+			out, _ := exec.CommandContext(pingCtx, "ping", "-a", "-n", "1", "-w", "250", ip).CombinedOutput()
+			// Match token immediately preceding [<ip>] regardless of Windows UI language
+			re := regexp.MustCompile(`([^\s\[\]:]+)\s+\[` + regexp.QuoteMeta(ip) + `\]`)
+			if m := re.FindStringSubmatch(string(out)); len(m) >= 2 {
+				candidate := strings.TrimSpace(m[1])
+				if candidate != "" && candidate != ip {
+					resCh <- candidate
+				}
+			}
+		}()
+
+		go func() {
+			wg.Wait()
+			close(resCh)
+		}()
+
+		for name := range resCh {
+			if name != "" {
+				return name
 			}
 		}
 		return ""
 	}
 
 	// Linux / macOS: try 'getent hosts <ip>'
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 	if out, err := exec.CommandContext(ctx, "getent", "hosts", ip).CombinedOutput(); err == nil {
 		fields := strings.Fields(string(out))
 		if len(fields) >= 2 && fields[1] != ip {

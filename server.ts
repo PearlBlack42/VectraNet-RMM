@@ -714,10 +714,10 @@ async function resolveRealHostnameNode(ip: string, isSelfHost: boolean): Promise
       .reverse(ip)
       .then((names) => (names && names.length > 0 ? names[0].replace(/\.$/, '').trim() : ''))
       .catch(() => ''),
-    new Promise<string>((r) => setTimeout(() => r(''), 550)),
+    new Promise<string>((r) => setTimeout(() => r(''), 900)),
   ]);
 
-  const nbPromise = queryNetBiosNodeName(ip, 500);
+  const nbPromise = queryNetBiosNodeName(ip, 800);
 
   const [ptrName, nbName] = await Promise.all([ptrPromise, nbPromise]);
   if (ptrName && ptrName !== ip && !ptrName.toUpperCase().startsWith('HOST-')) {
@@ -727,18 +727,29 @@ async function resolveRealHostnameNode(ip: string, isSelfHost: boolean): Promise
     return nbName;
   }
 
-  // 2. OS command fallback (Windows 'ping -a' or Linux 'getent hosts')
+  // 2. OS command fallback (Windows 'nbtstat -A' + 'ping -a' or Linux 'getent hosts')
   try {
     if (os.platform() === 'win32') {
-      const { stdout } = await execFileAsync('ping', ['-a', '-n', '1', '-w', '450', ip], {
-        timeout: 700,
-      });
-      const m = stdout.match(/Pinging\s+([^\s\[\]]+)\s+\[\d+\.\d+\.\d+\.\d+\]/i);
-      if (m && m[1] && m[1] !== ip) {
-        return m[1].trim();
+      const [nbtRes, pingRes] = await Promise.allSettled([
+        execFileAsync('nbtstat', ['-A', ip], { timeout: 1400 }),
+        execFileAsync('ping', ['-a', '-n', '1', '-w', '250', ip], { timeout: 1600 }),
+      ]);
+      if (nbtRes.status === 'fulfilled' && nbtRes.value.stdout) {
+        const m = nbtRes.value.stdout.match(/^\s*([A-Za-z0-9\-_]{1,15})\s+<(?:00|20)>\s+UNIQUE/m);
+        if (m && m[1] && m[1].trim() !== ip) {
+          return m[1].trim();
+        }
+      }
+      if (pingRes.status === 'fulfilled' && pingRes.value.stdout) {
+        const escapedIp = ip.replace(/\./g, '\\.');
+        const re = new RegExp(`([^\\s\\[\\]:]+)\\s+\\[${escapedIp}\\]`, 'i');
+        const m = pingRes.value.stdout.match(re);
+        if (m && m[1] && m[1].trim() !== ip) {
+          return m[1].trim();
+        }
       }
     } else {
-      const { stdout } = await execFileAsync('getent', ['hosts', ip], { timeout: 500 });
+      const { stdout } = await execFileAsync('getent', ['hosts', ip], { timeout: 800 });
       const parts = stdout.trim().split(/\s+/);
       if (parts.length >= 2 && parts[1] !== ip && parts[1].toLowerCase() !== 'localhost') {
         return parts[1].trim();
@@ -748,7 +759,8 @@ async function resolveRealHostnameNode(ip: string, isSelfHost: boolean): Promise
     // Ignore OS command fallback errors
   }
 
-  return `HOST-${ip.replace(/\./g, '-')}`;
+  // Never use 'HOST-172-...' or mock names; return the clean IPv4 address if no name protocol responded
+  return ip;
 }
 
 async function runRealSubnetSweepNode(jobId: string, cidr: string, ips: string[]) {
@@ -835,15 +847,20 @@ async function runRealSubnetSweepNode(jobId: string, cidr: string, ips: string[]
         const prev = existingIdx >= 0 ? liveDevices[existingIdx] : undefined;
         const isAlreadyActive = prev?.agentState === 'active';
 
-        // Prefer real resolved hostname over fallback 'HOST-...' while preserving existing real hostnames
+        // Prefer real resolved hostname over raw IP while preserving existing real hostnames
         const prevHasRealHostname =
-          Boolean(prev?.hostname) && !prev!.hostname.toUpperCase().startsWith('HOST-');
-        const resolvedIsReal = !resolvedName.toUpperCase().startsWith('HOST-');
+          Boolean(prev?.hostname) &&
+          prev!.hostname !== ip &&
+          !prev!.hostname.toUpperCase().startsWith('HOST-');
+        const resolvedIsReal =
+          Boolean(resolvedName) &&
+          resolvedName !== ip &&
+          !resolvedName.toUpperCase().startsWith('HOST-');
         const finalHostname = resolvedIsReal
           ? resolvedName
           : prevHasRealHostname
           ? prev!.hostname
-          : resolvedName;
+          : ip;
 
         // Discovered hosts without an active agent MUST stay 'agentless' with 0% CPU and 0 GB RAM (never copying another host's metrics!)
         const deviceRecord: DeviceAsset = {
